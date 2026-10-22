@@ -92,96 +92,121 @@ def _int(v) -> int:
 
 
 # 엔트리 = [timestamp, provider, model, total, cost, dedup_key]
-def parse_claude_file(path: str) -> list:
+#
+# 로그 파일은 끝에 덧붙여지기만 하므로, 파일별로 '어디까지 읽었는지(바이트 오프셋)'를 기억해 두고
+# 다음엔 새로 붙은 줄만 읽는다 — 수백 MB 짜리 세션 로그도 2분마다 통째로 다시 읽지 않는다.
+
+def _lines_from(path: str, off: int):
+    """off 바이트부터 '완성된 줄'만 내놓는다. 마지막 줄이 아직 쓰이는 중이면 다음 번에 읽는다.
+    (줄, 그 줄 끝의 오프셋)을 차례로 yield."""
+    with open(path, "rb") as f:
+        f.seek(off)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                return
+            off += len(raw)
+            yield raw.decode("utf-8", errors="replace"), off
+
+
+def parse_claude_file(path: str, off: int = 0, prior: list | None = None) -> tuple[list, int]:
+    """Claude Code 세션 로그. 같은 (message.id, requestId) 는 total 이 가장 큰 것만 남긴다."""
     out: dict[str, list] = {}
     anon = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if '"usage"' not in line:
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            msg = obj.get("message")
-            if not isinstance(msg, dict):
-                continue
-            usage = msg.get("usage")
-            if not isinstance(usage, dict):
-                continue
-            ts = _ts(obj.get("timestamp"))
-            if ts is None:
-                continue
-            inp = _int(usage.get("input_tokens"))
-            outp = _int(usage.get("output_tokens"))
-            cw = _int(usage.get("cache_creation_input_tokens"))
-            cr = _int(usage.get("cache_read_input_tokens"))
-            total = inp + outp + cw + cr
-            if total <= 0:
-                continue
-            model = msg.get("model")
-            if model == "<synthetic>":
-                continue
-            e = [ts, "claude", model, total, cost_of(model, inp, outp, cw, cr), None]
-            mid, rid = msg.get("id"), obj.get("requestId")
-            if mid or rid:
-                key = f"{mid or ''}|{rid or ''}"
-                e[5] = key
-                prev = out.get(key)
-                if prev is None or prev[3] < total:
-                    out[key] = e
-            else:
-                anon.append(e)
-    return list(out.values()) + anon
+    for e in prior or []:
+        if e[5]:
+            out[e[5]] = e
+        else:
+            anon.append(e)
+    new_off = off
+    for line, new_off in _lines_from(path, off):
+        if '"usage"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        ts = _ts(obj.get("timestamp"))
+        if ts is None:
+            continue
+        inp = _int(usage.get("input_tokens"))
+        outp = _int(usage.get("output_tokens"))
+        cw = _int(usage.get("cache_creation_input_tokens"))
+        cr = _int(usage.get("cache_read_input_tokens"))
+        total = inp + outp + cw + cr
+        if total <= 0:
+            continue
+        model = msg.get("model")
+        if model == "<synthetic>":
+            continue
+        e = [ts, "claude", model, total, cost_of(model, inp, outp, cw, cr), None]
+        mid, rid = msg.get("id"), obj.get("requestId")
+        if mid or rid:
+            key = f"{mid or ''}|{rid or ''}"
+            e[5] = key
+            prev = out.get(key)
+            if prev is None or prev[3] < total:
+                out[key] = e
+        else:
+            anon.append(e)
+    return list(out.values()) + anon, new_off
 
 
-def parse_codex_file(path: str, limits_sink: dict) -> list:
-    entries = []
-    model = None
-    prev_cum = None
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if '"turn_context"' in line or '"session_meta"' in line:
-                try:
-                    obj = json.loads(line)
-                    m = (obj.get("payload") or {}).get("model")
-                    if m:
-                        model = m
-                except ValueError:
-                    pass
-                continue
-            if '"token_count"' not in line:
-                continue
+def parse_codex_file(path: str, limits_sink: dict, off: int = 0, prior: list | None = None,
+                     state: dict | None = None) -> tuple[list, int, dict]:
+    """Codex 세션 로그 — token_count 이벤트의 last_token_usage(턴 델타).
+    state 는 이어 읽기용 (직전 모델, 직전 누적값)."""
+    entries = list(prior or [])
+    st = dict(state or {})
+    model, prev_cum = st.get("model"), st.get("prev_cum")
+    new_off = off
+    for line, new_off in _lines_from(path, off):
+        if '"turn_context"' in line or '"session_meta"' in line:
             try:
                 obj = json.loads(line)
+                m = (obj.get("payload") or {}).get("model")
+                if m:
+                    model = m
             except ValueError:
-                continue
-            payload = obj.get("payload") or {}
-            if payload.get("type") != "token_count":
-                continue
-            ts = _ts(obj.get("timestamp"))
-            rl = payload.get("rate_limits")
-            if ts and isinstance(rl, dict) and ts > limits_sink.get("ts", 0):
-                limits_sink.update({"ts": ts, "data": rl})
-            info = payload.get("info")
-            if not isinstance(info, dict) or ts is None:
-                continue
-            cum = info.get("total_token_usage")
-            if cum is not None and cum == prev_cum:  # 같은 상태가 반복 기록된 경우
-                continue
-            prev_cum = cum
-            last = info.get("last_token_usage")
-            if not isinstance(last, dict):
-                continue
-            inp = _int(last.get("input_tokens"))
-            cached = _int(last.get("cached_input_tokens"))
-            outp = _int(last.get("output_tokens"))
-            total = _int(last.get("total_tokens")) or (inp + outp)
-            if total <= 0:
-                continue
-            c = cost_of(model, max(0, inp - cached), outp, 0, cached)
-            entries.append([ts, "codex", model, total, c, None])
-    return entries
+                pass
+            continue
+        if '"token_count"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        payload = obj.get("payload") or {}
+        if payload.get("type") != "token_count":
+            continue
+        ts = _ts(obj.get("timestamp"))
+        rl = payload.get("rate_limits")
+        if ts and isinstance(rl, dict) and ts > limits_sink.get("ts", 0):
+            limits_sink.update({"ts": ts, "data": rl})
+        info = payload.get("info")
+        if not isinstance(info, dict) or ts is None:
+            continue
+        cum = info.get("total_token_usage")
+        if cum is not None and cum == prev_cum:  # 같은 상태가 반복 기록된 경우
+            continue
+        prev_cum = cum
+        last = info.get("last_token_usage")
+        if not isinstance(last, dict):
+            continue
+        inp = _int(last.get("input_tokens"))
+        cached = _int(last.get("cached_input_tokens"))
+        outp = _int(last.get("output_tokens"))
+        total = _int(last.get("total_tokens")) or (inp + outp)
+        if total <= 0:
+            continue
+        c = cost_of(model, max(0, inp - cached), outp, 0, cached)
+        entries.append([ts, "codex", model, total, c, None])
+    return entries, new_off, {"model": model, "prev_cum": prev_cum}
 
 
 def _claude_roots() -> list[Path]:
@@ -257,6 +282,9 @@ class UsageSummary:
         return sum(t for _, t in ev[i:j])
 
 
+CACHE_VERSION = 3
+
+
 class UsageScanner:
     def __init__(self, cache_path: Path):
         self.cache_path = cache_path
@@ -264,11 +292,11 @@ class UsageScanner:
         self.cache: dict = {}
         try:
             self.cache = json.loads(cache_path.read_text(encoding="utf-8"))
-            if self.cache.get("v") != 2:
+            if self.cache.get("v") != CACHE_VERSION:
                 self.cache = {}
         except (OSError, ValueError):
             self.cache = {}
-        self.cache.setdefault("v", 2)
+        self.cache.setdefault("v", CACHE_VERSION)
         self.cache.setdefault("files", {})
 
     def _files(self):
@@ -295,12 +323,21 @@ class UsageScanner:
                 c = files.get(p)
                 if c and c["m"] == st.st_mtime and c["s"] == st.st_size:
                     continue
-                sink: dict = {}
+                # 커지기만 했으면 이어 읽기, 줄었거나(새로 쓰임) 처음이면 처음부터
+                grow = bool(c) and st.st_size >= c["s"] and c.get("o", 0) <= st.st_size
+                off = c["o"] if grow else 0
+                prior = c["e"] if grow else None
+                sink: dict = dict(c.get("l") or {}) if grow else {}
                 try:
-                    ents = parse_claude_file(p) if prov == "claude" else parse_codex_file(p, sink)
+                    if prov == "claude":
+                        ents, new_off = parse_claude_file(p, off, prior)
+                        state = None
+                    else:
+                        ents, new_off, state = parse_codex_file(p, sink, off, prior, c.get("st") if grow else None)
                 except OSError:
                     continue
-                files[p] = {"m": st.st_mtime, "s": st.st_size, "e": ents, "l": sink or None}
+                files[p] = {"m": st.st_mtime, "s": st.st_size, "o": new_off, "e": ents,
+                            "l": sink or None, "st": state}
                 changed = True
             for p in list(files):
                 if p not in seen:

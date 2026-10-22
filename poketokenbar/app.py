@@ -30,7 +30,8 @@ APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 FONT = "Malgun Gothic"
 C = {"bg": "#f4f5f7", "card": "#ffffff", "text": "#1f2328", "sub": "#6e7781", "line": "#e3e5e8",
      "accent": "#e03131", "bar": "#4dabf7", "bar_today": "#e03131", "track": "#e9ecef", "egg": "#f59f00"}
-CALIBRATE_DAYS = 7  # 사용량 맞추기: 일반 포켓몬이 이만큼(사용한 날 기준)에 졸업
+CALIBRATE_DAYS = 7
+PROVISIONAL_DIFF = 0.05  # 기록이 없는 새 사용자의 임시 성장 배율 (하루 ~5M 토큰 쓰는 사람 기준)  # 사용량 맞추기: 일반 포켓몬이 이만큼(사용한 날 기준)에 졸업
 PRESETS = [("원본 (100%)", 1.0), ("보통 (25%)", 0.25), ("쉬움 (10%)", 0.1), ("아주 쉬움 (2%)", 0.02),
            ("초고속 (0.5%)", 0.005)]
 
@@ -56,10 +57,24 @@ def josa(word: str, pair: str) -> str:
     return word + a if pair != "으로/로" else word + b
 
 
+_LOG_SEEN: dict[str, float] = {}
+LOG_MAX_BYTES = 1_000_000
+
+
 def log_error(msg: str):
+    """error.log 에 남긴다. 같은 오류는 10분에 한 번만, 파일이 1MB 를 넘으면 error.log.1 로 넘긴다."""
+    lines = msg.strip().splitlines()
+    sig = lines[-1][:200] if lines else msg
+    now = time.time()
+    if now - _LOG_SEEN.get(sig, 0) < 600:
+        return
+    _LOG_SEEN[sig] = now
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        with open(APP_DIR / "error.log", "a", encoding="utf-8") as f:
+        path = APP_DIR / "error.log"
+        if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            os.replace(path, APP_DIR / "error.log.1")
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
     except OSError:
         pass
@@ -738,6 +753,15 @@ class App:
         self.pet = PetWindow(self)
         self.taskbar = TaskbarWidget(self)
         self.tray = Tray(self)
+        k32 = ctypes.windll.kernel32
+        k32.CreateEventW.restype = ctypes.c_void_p
+        self._show_event = k32.CreateEventW(None, False, False, SHOW_EVENT)
+        if self.comp.recovered_from == "backup":
+            self.root.after(3000, lambda: self.tray.notify(
+                "저장 파일을 복구했어요", "저장 파일이 손상돼서 직전 백업에서 불러왔어요. 포켓몬은 무사해요!"))
+        elif self.comp.recovered_from == "reset":
+            self.root.after(3000, lambda: self.tray.notify(
+                "저장 파일을 읽지 못했어요", "손상된 파일은 데이터 폴더에 따로 보관했어요 (state.corrupt-*.json)."))
         self.refresh_all()
         threading.Thread(target=self._scan_loop, daemon=True).start()
         self.wx_wake = threading.Event()
@@ -781,6 +805,10 @@ class App:
                     log_error(traceback.format_exc())
         except queue.Empty:
             pass
+        # 바로가기를 또 눌러 두 번째로 실행되면 신호가 온다 → 창을 앞으로
+        if self._show_event and ctypes.windll.kernel32.WaitForSingleObject(
+                ctypes.c_void_p(self._show_event), 0) == 0:
+            self.show_main()
         if self.running:
             self.root.after(100, self._pump)
 
@@ -941,7 +969,10 @@ class App:
     def frames_for(self, key, size):
         ck = (key, size)
         if ck in self.frame_cache:
+            self.frame_cache[ck] = self.frame_cache.pop(ck)  # 최근 사용으로
             return self.frame_cache[ck]
+        while len(self.frame_cache) > 80:  # 가장 오래 안 쓴 것부터 버린다
+            self.frame_cache.pop(next(iter(self.frame_cache)))
         if key == "egg":
             wob = [0, 0, 0, 0, -7, 0, 7, 0, 0, 0]
             res = ([egg_image(size, w, self.pikachu_mode) for w in wob], [180] * len(wob))
@@ -978,6 +1009,9 @@ class App:
         ck = (key, size, frame)
         if ck in self.photos:
             return self.photos[ck]
+        if len(self.photos) > 400:  # 도감 페이지를 많이 넘겨도 메모리가 계속 늘지 않게
+            for k in [k for k in self.photos if k[0] not in ("item", "blank")][:200]:
+                del self.photos[k]
         ph = ImageTk.PhotoImage(frames[min(frame, len(frames) - 1)], master=master or self.root)
         if key == "egg" or (key, size) in self.frame_cache:  # 다운로드 전 임시 알 이미지는 캐시하지 않음
             self.photos[ck] = ph
@@ -1312,7 +1346,8 @@ class App:
         self.h_today.configure(text=f"{fmt_tokens(self.today_total())} 토큰")
         self.h_cost.configure(text=f"API 환산 ${s.today_cost:,.2f}")
         if not s.providers_found:
-            lbl(self.h_prov, "Claude Code / Codex 로그를 찾지 못했어요.", 9, color=C["accent"]).pack(anchor="w")
+            lbl(self.h_prov, "Claude Code·Codex 기록은 없어요 — Claude 로그인으로 채팅 사용량이 반영돼요.", 9,
+                color=C["sub"]).pack(anchor="w")
         rows = sorted(s.today_by_model.items(), key=lambda kv: -kv[1])[:6]
         app_today = self.comp.claude_app_today() if self.comp.settings.get("claude_app", True) else 0
         if app_today:
@@ -1911,13 +1946,25 @@ class App:
 
     def calibrate(self, silent=False):
         """최근 사용량에 맞춰 성장/가격 배율을 정한다 — 일반 포켓몬(Lv5→Lv50)이 사용한 날 기준 약 7일에 졸업하도록."""
-        s = self.summary
-        days = [t for _, t, _ in s.daily[-14:] if t > 0] if s else []
-        if not days:
+        days = self.daily_usage(14)
+        today = dt.date.today()
+        past = [t for d, t in days.items() if d < today and t > 0]
+        if len(past) < 2 and not self.comp.s.get("calibrated"):
+            # 기록이 거의 없는 새 사용자 (예: Claude 채팅만 쓰는 경우) — 임시 배율로 시작하고,
+            # 이틀 이상 쌓이면 자동으로 다시 맞춘다.
+            if self.comp.settings["growth_difficulty"] == 1.0:
+                self.comp.settings["growth_difficulty"] = self.comp.settings["price_difficulty"] = PROVISIONAL_DIFF
+                self.comp.save()
+                self._sync_diff_vars()
+                self._update_estimate()
             if not silent:
-                messagebox.showinfo("사용량에 맞추기", "최근 사용 기록이 없어 계산할 수 없어요.", parent=self.root)
+                messagebox.showinfo("사용량에 맞추기", "아직 사용 기록이 부족해요. 이틀 정도 쓰고 나면 자동으로 맞춰져요.",
+                                    parent=self.root)
             return
-        avg = sum(days) / len(days)
+        used = [t for t in days.values() if t > 0]
+        if not used:
+            return
+        avg = sum(used) / len(used)
         f = max(0.002, min(1.0, avg * CALIBRATE_DAYS / COMMON_GRAD_TOKENS))
         f = float(f"{f:.2g}")
         self.comp.settings["growth_difficulty"] = f
@@ -1932,6 +1979,21 @@ class App:
         if not silent:
             self.refresh_all()
 
+    def daily_usage(self, n: int) -> dict:
+        """최근 n일 날짜별 사용량 = Claude Code·Codex 토큰 + Claude 앱(채팅·Cowork) 환산분."""
+        out = {}
+        if self.summary:
+            for d, t, _ in self.summary.daily[-n:]:
+                out[d] = t
+        for key, t in self.comp.s.get("claude_app_daily", {}).items():
+            try:
+                d = dt.date.fromisoformat(key)
+            except ValueError:
+                continue
+            if (dt.date.today() - d).days < n:
+                out[d] = out.get(d, 0) + t
+        return out
+
     def _sync_diff_vars(self):
         st = self.comp.settings
         for var, key in ((self.v_growth, "growth_difficulty"), (self.v_price, "price_difficulty")):
@@ -1943,7 +2005,7 @@ class App:
         if not s:
             self.l_estimate.configure(text="")
             return
-        used = [t for _, t, _ in s.daily[-14:] if t > 0]
+        used = [t for t in self.daily_usage(14).values() if t > 0]
         if not used:
             self.l_estimate.configure(text="최근 사용 기록이 없어 예상치를 계산할 수 없어요.")
             return
@@ -1999,10 +2061,22 @@ def set_autostart(on: bool):
 
 
 # ---------------------------------------------------------------- entry
+SHOW_EVENT = "Local\\PokeTokenBarWin_Show"
+
+
 def main():
     k32 = ctypes.windll.kernel32
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    k32.OpenEventW.restype = ctypes.c_void_p
     k32.CreateMutexW(None, False, "Local\\PokeTokenBarWin_SingleInstance")
-    if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    if k32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS — 이미 실행 중
+        if "--hidden" in sys.argv:
+            return  # 자동 실행이 겹친 경우: 조용히 끝낸다
+        ev = k32.OpenEventW(0x0002, False, SHOW_EVENT)  # EVENT_MODIFY_STATE
+        if ev:  # 실행 중인 앱에 '창 띄워 줘' 신호
+            k32.SetEvent(ctypes.c_void_p(ev))
+            k32.CloseHandle(ctypes.c_void_p(ev))
+            return
         r = tk.Tk()
         r.withdraw()
         messagebox.showinfo("PokeTokenBar", "이미 실행 중이에요. 작업 표시줄 오른쪽 트레이 아이콘을 확인해 주세요.")

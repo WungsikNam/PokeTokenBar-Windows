@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -200,10 +201,8 @@ GENERATIONS = [(1, 1, 151), (2, 152, 251), (3, 252, 386), (4, 387, 493), (5, 494
 class Companion:
     def __init__(self, path: Path):
         self.path = path
-        try:
-            self.s = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.s = {}
+        self.recovered_from: str | None = None  # 'backup' / 'reset' — 앱이 사용자에게 알려준다
+        self.s = self._load(path)
         s = self.s
         s.setdefault("version", STATE_VERSION if not s else 1)
         s.setdefault("last_total", None)
@@ -226,13 +225,70 @@ class Companion:
         if s["version"] < 3:  # v3 레벨제 — 성장 곡선이 바뀌었으니 사용량 보정을 다시 한다
             s["calibrated"] = False
             s["version"] = 3
+        self._validate()
         if s["active"]:
             add_megas(s["active"]["tree"], s["active"]["names"], str_keys=True)
 
     # ---------- 저장 ----------
+    def _load(self, path: Path) -> dict:
+        """state.json 을 읽는다. 깨졌으면 원본은 따로 보관하고 직전 백업(state.bak)에서 복구한다."""
+        bak = path.with_suffix(".bak")
+        if not path.exists() and not bak.exists():
+            return {}  # 첫 실행
+        for cand in (path, bak):
+            try:
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data:
+                    if cand == bak:
+                        self.recovered_from = "backup"
+                    return data
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                pass
+            if cand == path and path.exists():  # 깨진 원본은 지우지 않고 보관
+                try:
+                    shutil.copy2(path, path.with_name(f"state.corrupt-{int(time.time())}.json"))
+                except OSError:
+                    pass
+        self.recovered_from = "reset"
+        return {}
+
+    def _validate(self):
+        """값이 망가진 부분만 고쳐서, 한 군데 문제로 앱 전체가 멈추지 않게 한다."""
+        s = self.s
+        for key, typ, default in (("dex", dict, {}), ("graduates", list, []), ("graduated_lines", list, []),
+                                  ("bag", dict, {"rare_candy": 0, "mint": 0}),
+                                  ("egg", dict, {"progress": 0, "tier": None})):
+            if not isinstance(s.get(key), typ):
+                s[key] = default
+        for key in ("earned", "spent"):
+            if not isinstance(s.get(key), (int, float)):
+                s[key] = 0
+        if not isinstance(s["egg"].get("progress"), (int, float)):
+            s["egg"]["progress"] = 0
+        a = s.get("active")
+        if a is not None:
+            try:
+                assert isinstance(a, dict) and a["current_id"] in tree_ids(a["tree"]) and a["path"]
+                assert isinstance(a["progress"], (int, float))
+                self.phase_threshold(a)
+            except Exception:  # noqa: BLE001 — 키우던 개체 정보가 망가짐 → 보관하고 새 알로
+                s["broken_active"] = a
+                s["active"] = None
+
     def save(self):
+        """임시 파일에 다 쓴 뒤 교체한다 (도중에 꺼져도 원본이 남는다). 직전 상태는 state.bak 으로 둔다."""
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.s, ensure_ascii=False, indent=1), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(self.s, ensure_ascii=False, indent=1))
+            f.flush()
+            os.fsync(f.fileno())
+        if self.path.exists():
+            try:
+                shutil.copy2(self.path, self.path.with_suffix(".bak"))
+            except OSError:
+                pass
         os.replace(tmp, self.path)
 
     @property

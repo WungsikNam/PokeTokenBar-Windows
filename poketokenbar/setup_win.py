@@ -15,7 +15,7 @@ from pathlib import Path
 
 APP = "PokeTokenBar"
 EXE_NAME = "PokeTokenBar.exe"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 RUN_VALUE = "PokeTokenBarWin"  # 앱 설정의 '자동 실행'과 같은 이름
 UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP}"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
