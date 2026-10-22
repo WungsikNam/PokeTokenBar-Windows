@@ -17,16 +17,18 @@ from tkinter import messagebox, ttk
 import pystray
 from PIL import Image, ImageTk
 
-from .companion import (CANDY_XP, DEX_MAX, GENERATIONS, GRAD_TOTAL, ITEM_SPRITES, MEGA_SPECIES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
-                        dex_no, display_name, find_node, roll_hatch, tree_depth)
+from .companion import (COMMON_GRAD_TOKENS, DEX_MAX, GENERATIONS, ITEM_SPRITES, RARITY_MULT, MEGA_SPECIES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
+                        dex_no, display_name, enrich_line, exp_at, find_node, roll_hatch, tree_depth)
 from .pokedata import PokeData, egg_image, load_frames
 from .usage import UsageScanner, fmt_tokens
+from . import weather as wx
 
 APP_NAME = "PokeTokenBarWin"
 APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 FONT = "Malgun Gothic"
 C = {"bg": "#f4f5f7", "card": "#ffffff", "text": "#1f2328", "sub": "#6e7781", "line": "#e3e5e8",
      "accent": "#e03131", "bar": "#4dabf7", "bar_today": "#e03131", "track": "#e9ecef", "egg": "#f59f00"}
+CALIBRATE_DAYS = 7  # 사용량 맞추기: 일반 포켓몬이 이만큼(사용한 날 기준)에 졸업
 PRESETS = [("원본 (100%)", 1.0), ("보통 (25%)", 0.25), ("쉬움 (10%)", 0.1), ("아주 쉬움 (2%)", 0.02),
            ("초고속 (0.5%)", 0.005)]
 
@@ -720,6 +722,7 @@ class App:
         self.wake = threading.Event()
         self.dex_dirty = True
         self.dex_page = 0
+        self.weather = self.comp.s.get("weather")
         self.dex_filter = tk.StringVar(master=self.root, value="all")
 
         self._style()
@@ -731,6 +734,16 @@ class App:
         self.tray = Tray(self)
         self.refresh_all()
         threading.Thread(target=self._scan_loop, daemon=True).start()
+        self.wx_wake = threading.Event()
+        threading.Thread(target=self._weather_loop, daemon=True).start()
+        a = self.comp.active
+        if a and "growth_rate" not in a:
+            def enrich(a=dict(a)):
+                try:
+                    self.post(self._on_enriched, enrich_line(self.pd, a))
+                except Exception:  # noqa: BLE001
+                    log_error("enrich: " + traceback.format_exc())
+            threading.Thread(target=enrich, daemon=True).start()
         self.root.after(100, self._pump)
         if start_hidden or self.comp.settings.get("start_hidden"):
             self.root.withdraw()
@@ -774,6 +787,28 @@ class App:
             self.wake.wait(timeout=max(1, self.comp.settings["refresh_min"]) * 60)
             self.wake.clear()
 
+    def _weather_loop(self):
+        while self.running:
+            if self.comp.settings.get("weather_boost", True):
+                try:
+                    w = wx.fetch(self.comp.settings.get("city", "서울"))
+                    self.post(self._on_weather, w)
+                except Exception:  # noqa: BLE001
+                    log_error("weather: " + traceback.format_exc())
+            self.wx_wake.wait(timeout=30 * 60)
+            self.wx_wake.clear()
+
+    def _on_weather(self, w):
+        self.weather = w
+        self.comp.s["weather"] = w
+        self.comp.save()
+        self.refresh_all()
+
+    def current_boost(self) -> list[str]:
+        if not self.comp.settings.get("weather_boost", True) or self.pikachu_mode:
+            return []
+        return wx.boost_types(self.weather)
+
     def refresh_now(self):
         self.wake.set()
 
@@ -789,6 +824,12 @@ class App:
         self._update_estimate()
         self.refresh_all()
 
+    def _on_enriched(self, r):
+        events = self.comp.apply_enrich(r)
+        self.comp.save()
+        self.handle_events(events)
+        self.refresh_all()
+
     def maybe_hatch(self):
         if not self.comp.egg_ready() or self.hatching:
             return
@@ -797,10 +838,14 @@ class App:
         tier = self.comp.egg.get("tier")
         charm = self.comp.s["shiny_charm"]
         fixed = self.comp.settings.get("fixed_base")
+        boost = self.current_boost()
+        w = self.weather if boost else None
 
         def work():
             try:
-                r = roll_hatch(self.pd, collected, tier, charm, fixed)
+                r = roll_hatch(self.pd, collected, tier, charm, fixed, boost)
+                if w:
+                    r["born_weather"] = w["kind"]
                 self.post(self.on_hatched, r)
             except Exception as e:  # noqa: BLE001
                 log_error("hatch: " + traceback.format_exc())
@@ -831,6 +876,10 @@ class App:
                 _, name, rarity, shiny = ev
                 title = "✨ 색이 다른 포켓몬이 태어났어요!" if shiny else "알이 부화했어요!"
                 msg = f"{josa(name, '이/가')} 태어났어요! ({RARITY_KO[rarity]})"
+                bw = (self.comp.active or {}).get("born_weather")
+                if bw:
+                    msg = f"{wx.WEATHERS[bw][0]} 오는 날, " + msg if bw in ("rain", "snow") else \
+                        f"{wx.WEATHERS[bw][0]} 날씨에 " + msg
             elif kind == "evolve":
                 a, b = ev[1], ev[2]
                 if len(ev) > 3 and ev[3] in MEGA_SPECIES:
@@ -934,9 +983,8 @@ class App:
     def status_text(self) -> str:
         a = self.comp.active
         if a:
-            head = self.comp.name_of(a["current_id"]) + (" ✨" if a["shiny"] else "")
-            thr = self.comp.phase_threshold()
-            head += f"  ({a['progress'] / thr:.0%})"
+            head = (self.comp.name_of(a["current_id"]) + (" ✨" if a["shiny"] else "")
+                    + f"  Lv.{self.comp.level()}")
         else:
             thr = self.comp.egg_threshold()
             head = f"알 ({min(1, self.comp.egg['progress'] / thr):.0%})"
@@ -1089,6 +1137,8 @@ class App:
     def _build_home(self):
         p = self.tab_home.inner
         tk.Frame(p, bg=C["bg"], height=10).pack()
+        self.h_weather = lbl(p, "", 9, color="#1971c2", wraplength=W(400), justify="left")
+        self.h_weather.pack(fill="x", padx=W(14), pady=(0, 6))
         c1 = card(p)
         self.h_sprite = tk.Label(c1, bg=C["card"], width=W(170), height=W(170))
         self.h_sprite.pack()
@@ -1133,6 +1183,12 @@ class App:
 
     def _refresh_home(self):
         comp, a = self.comp, self.comp.active
+        if self.pikachu_mode:
+            self.h_weather.configure(text="피카츄 키우기 모드 — 날씨와 상관없이 피츄가 태어나요")
+        elif not comp.settings.get("weather_boost", True):
+            self.h_weather.configure(text="날씨 보너스 꺼짐 — 설정에서 켤 수 있어요")
+        else:
+            self.h_weather.configure(text=wx.describe(self.weather))
         key = self.current_key()
         if key != self.h_sprite_key:
             self.h_sprite_key = key
@@ -1151,10 +1207,14 @@ class App:
             self.h_meta.configure(text=meta, fg=RARITY_COLOR[a["rarity"]])
             thr = comp.phase_threshold()
             node = comp.current_node()
-            nxt = "다음 진화" if node and node["children"] else "졸업"
+            lv = comp.level()
+            _, goal, evolves = comp.stage_levels()
+            nxt = f"Lv.{goal} 진화" if evolves else f"Lv.{goal} 졸업"
+            self.h_name.configure(text=f"{name}{'  ✨' if a['shiny'] else ''}   Lv.{lv}")
             bar(self.h_bar, a["progress"] / thr, "#f5b800" if self.pikachu_mode else RARITY_COLOR[a["rarity"]])
-            self.h_prog.configure(text=f"{nxt}까지 {fmt_tokens(a['progress'])} / {fmt_tokens(thr)}  "
-                                       f"({a['progress'] / thr:.0%})")
+            self.h_prog.configure(text=f"{nxt}까지 {fmt_tokens(max(0, thr - a['progress']))} 남음  "
+                                       f"({a['progress'] / thr:.0%}) · 다음 레벨까지 "
+                                       f"{fmt_tokens(comp.tokens_to_next_level())}")
             # 진화 라인: 지나온 단계 + 현재 + 남은 단계(?)
             for i, sid in enumerate(a["path"]):
                 if i:
@@ -1284,7 +1344,8 @@ class App:
         shinies = sum(1 for d in dex.values() if d.get("shiny"))
         mode = ("피카츄 키우기 모드예요 — 피츄 라인만 부화해요. 설정에서 끄면 랜덤 부화로 도감을 채울 수 있어요."
                 if self.pikachu_mode else
-                "알에서는 1~5세대 기본형 중 하나가 무작위로 태어나요 (흔한 포켓몬일수록 자주, 전설은 드물게). "
+                "알에서는 1~5세대 기본형 중 하나가 무작위로 태어나요 (흔한 포켓몬일수록 자주, 전설은 드물게, "
+                "날씨에 맞는 타입은 더 자주). 졸업시킨 라인은 다시 나오지 않으니 졸업할수록 도감이 넓어져요. "
                 "키우면서 진화한 모습도 도감에 등록돼요.")
         lbl(c, f"졸업 {len(grads)}마리 · 이로치 {shinies}종\n{mode}", 8, color=C["sub"],
             wraplength=W(380), justify="left").pack(anchor="w", pady=(8, 0))
@@ -1518,6 +1579,22 @@ class App:
         lbl(c, "끄면 원본처럼 1~5세대 포켓몬이 무작위로 부화해요.", 8, color=C["sub"]).pack(anchor="w", pady=(4, 0))
 
         c = card(p)
+        lbl(c, "날씨", 11, True).pack(anchor="w")
+        self.v_wx = tk.BooleanVar(value=st.get("weather_boost", True))
+        ttk.Checkbutton(c, text="실제 날씨에 따라 잘 나오는 타입 바꾸기", variable=self.v_wx,
+                        command=lambda: self._set_weather(self.v_wx.get())).pack(anchor="w", pady=(4, 0))
+        r = tk.Frame(c, bg=C["card"])
+        r.pack(fill="x", pady=(6, 0))
+        lbl(r, "지역", 10).pack(side="left")
+        self.v_city = tk.StringVar(value=st.get("city", "서울"))
+        cb = ttk.Combobox(r, textvariable=self.v_city, values=list(wx.CITIES), state="readonly", width=8)
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._set_city(self.v_city.get()))
+        lbl(c, "맑음: 불꽃·풀·땅 / 구름 조금: 노말·바위 / 흐림: 페어리·격투·독 / 비: 물·전기·벌레 / "
+               "바람: 드래곤·비행·에스퍼 / 눈: 얼음·강철 / 안개: 악·고스트 (포켓몬 GO 규칙, 해당 타입 5배)",
+            8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(4, 0))
+
+        c = card(p)
         lbl(c, "작업 표시줄", 11, True).pack(anchor="w")
         self.v_taskbar = tk.BooleanVar(value=st.get("taskbar_visible", True))
         ttk.Checkbutton(c, text="작업 표시줄에 포켓몬 + 오늘 토큰 표시", variable=self.v_taskbar,
@@ -1597,6 +1674,19 @@ class App:
             8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w")
         self._update_estimate()
 
+    def _set_weather(self, on: bool):
+        self.comp.settings["weather_boost"] = on
+        self.comp.save()
+        self.wx_wake.set()
+        self.refresh_all()
+
+    def _set_city(self, city: str):
+        self.comp.settings["city"] = city
+        self.weather = None
+        self.comp.save()
+        self.wx_wake.set()
+        self.refresh_all()
+
     def _set(self, key, value):
         self.comp.settings[key] = value
         self.comp.save()
@@ -1616,7 +1706,7 @@ class App:
         self.refresh_all()
 
     def calibrate(self, silent=False):
-        """최근 사용량에 맞춰 성장/가격 배율을 정한다 — 원본 기준(헤비 유저가 일반 포켓몬을 ~3일에 졸업)과 같은 체감."""
+        """최근 사용량에 맞춰 성장/가격 배율을 정한다 — 일반 포켓몬(Lv5→Lv50)이 사용한 날 기준 약 7일에 졸업하도록."""
         s = self.summary
         days = [t for _, t, _ in s.daily[-14:] if t > 0] if s else []
         if not days:
@@ -1624,7 +1714,7 @@ class App:
                 messagebox.showinfo("사용량에 맞추기", "최근 사용 기록이 없어 계산할 수 없어요.", parent=self.root)
             return
         avg = sum(days) / len(days)
-        f = max(0.002, min(1.0, avg * 3 / GRAD_TOTAL["common"]))
+        f = max(0.002, min(1.0, avg * CALIBRATE_DAYS / COMMON_GRAD_TOKENS))
         f = float(f"{f:.2g}")
         self.comp.settings["growth_difficulty"] = f
         self.comp.settings["price_difficulty"] = f
@@ -1649,20 +1739,24 @@ class App:
         if not s:
             self.l_estimate.configure(text="")
             return
-        avg = sum(t for _, t, _ in s.daily[-7:]) / 7
-        if avg <= 0:
-            self.l_estimate.configure(text="최근 7일 사용 기록이 없어 예상치를 계산할 수 없어요.")
+        used = [t for _, t, _ in s.daily[-14:] if t > 0]
+        if not used:
+            self.l_estimate.configure(text="최근 사용 기록이 없어 예상치를 계산할 수 없어요.")
             return
+        avg = sum(used) / len(used)
         g = self.comp.settings["growth_difficulty"]
+        per_exp = COMMON_GRAD_TOKENS / (exp_at("medium", 50) - exp_at("medium", 5)) * g
         egg_d = 5_000_000 * g / avg
-        com_d = GRAD_TOTAL["common"] * g / avg
-        leg_d = GRAD_TOTAL["legendary"] * g / avg
+        evo_d = (exp_at("medium-slow", 16) - exp_at("medium-slow", 5)) * per_exp / avg
+        com_d = COMMON_GRAD_TOKENS * g / avg
+        leg_d = (exp_at("slow", 50) - exp_at("slow", 5)) * per_exp * RARITY_MULT["legendary"] / avg
 
         def days(x):
             return f"{x * 24:.0f}시간" if x < 1 else f"{x:.0f}일"
         self.l_estimate.configure(
-            text=f"최근 일평균 {fmt_tokens(avg)} 기준 → 알 부화 약 {days(egg_d)}, "
-                 f"일반 포켓몬 졸업 약 {days(com_d)}, 전설 약 {days(leg_d)}")
+            text=f"사용한 날 평균 {fmt_tokens(avg)} 기준 → 알 부화 약 {days(egg_d)}, "
+                 f"파이리가 리자드로(Lv.16) 약 {days(evo_d)}, 일반 포켓몬 Lv.50 졸업 약 {days(com_d)}, "
+                 f"전설 약 {days(leg_d)}")
 
 
 # ---------------------------------------------------------------- autostart

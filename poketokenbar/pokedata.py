@@ -58,6 +58,7 @@ class PokeData:
                 "is_mythical": d["is_mythical"],
                 "evolves_from": (d.get("evolves_from_species") or {}).get("url"),
                 "chain": d["evolution_chain"]["url"],
+                "growth_rate": (d.get("growth_rate") or {}).get("name", "medium"),
                 "names": {n["language"]["name"]: n["name"] for n in d["names"]
                           if n["language"]["name"] in ("ko", "en", "ja-Hrkt", "ja")},
                 "genus": next((g["genus"] for g in d.get("genera", []) if g["language"]["name"] == "ko"), None),
@@ -65,19 +66,23 @@ class PokeData:
                                 for f in reversed(d.get("flavor_text_entries", []))
                                 if f["language"]["name"] == "ko"), None),
             }
-        return self._cached_json(f"species_{sid}", fetch)
+        return self._cached_json(f"species2_{sid}", fetch)
 
     def base_index(self) -> list[dict]:
-        """부화 후보: 진화 전 형태(base) 전체 (id ≤ 649, 메타몽 제외) + capture_rate."""
+        """부화 후보: 진화 전 형태(base) 전체 (id ≤ 649, 메타몽 제외) + capture_rate + 타입."""
         def fetch():
             q = ("{ pokemonspecies(where: {evolves_from_species_id: {_is_null: true}, "
-                 f"id: {{_lte: {MAX_ID}, _neq: {DITTO}}}}}, order_by: {{id: asc}}) {{ id capture_rate }} }}")
+                 f"id: {{_lte: {MAX_ID}, _neq: {DITTO}}}}}, order_by: {{id: asc}}) "
+                 "{ id capture_rate pokemons(where: {is_default: {_eq: true}}) "
+                 "{ pokemontypes { type { name } } } } }")
             d = json.loads(_get(GRAPHQL, json.dumps({"query": q}).encode()))
-            rows = d["data"]["pokemonspecies"]
+            rows = [{"id": r["id"], "capture_rate": r["capture_rate"],
+                     "types": [t["type"]["name"] for p in r["pokemons"][:1] for t in p["pokemontypes"]]}
+                    for r in d["data"]["pokemonspecies"]]
             if not rows:
                 raise ValueError("empty base index")
             return rows
-        return self._cached_json("base_index", fetch, max_age=30 * 86400)
+        return self._cached_json("base_index2", fetch, max_age=30 * 86400)
 
     def chain(self, url: str) -> dict:
         m = re.search(r"/evolution-chain/(\d+)/?$", url)
@@ -91,18 +96,37 @@ class PokeData:
             def build(node):
                 sid = int(node["species"]["url"].rstrip("/").split("/")[-1])
                 kids = [build(c) for c in node["evolves_to"]]
-                return {"id": sid, "children": [k for k in kids if k["id"] <= MAX_ID]}
+                out = {"id": sid, "children": [k for k in kids if k["id"] <= MAX_ID]}
+                # 이 종으로 진화하는 조건 — 레벨업이면 실제 진화 레벨, 아니면 조건 종류만 기록
+                det = node.get("evolution_details") or []
+                lv, trig = None, None
+                for e in det:
+                    if e.get("min_level"):
+                        lv = e["min_level"]
+                        break
+                if lv is None and det:
+                    e = det[0]
+                    t = (e.get("trigger") or {}).get("name")
+                    trig = "friendship" if e.get("min_happiness") else t
+                out["lv"], out["trig"] = lv, trig
+                return out
             return build(d["chain"])
-        return self._cached_json(f"chain_{cid}", fetch)
+        return self._cached_json(f"chain2_{cid}", fetch)
 
-    def pick_base(self, collected_bases: set[int], min_tier: str | None = None) -> int:
-        """capture_rate 가중 무작위 선택. 이미 졸업시킨 라인은 가중치 절반 (원본과 동일)."""
+    def pick_base(self, collected_bases: set[int], min_tier: str | None = None,
+                  boost: list[str] | None = None, boost_mult: int = 5) -> int:
+        """capture_rate 가중 무작위 선택.
+        - 이미 졸업시킨 라인은 다시 나오지 않는다 (전부 졸업했으면 다시 전체에서)
+        - 지금 날씨에 맞는 타입(boost)은 가중치 boost_mult 배"""
         ceilings = {"uncommon": 120, "rare": 45}
         try:
             idx = self.base_index()
             if min_tier in ceilings:
                 idx = [e for e in idx if e["capture_rate"] <= ceilings[min_tier]]
-            weights = [max(1, e["capture_rate"] // 2) if e["id"] in collected_bases else max(1, e["capture_rate"])
+            fresh = [e for e in idx if e["id"] not in collected_bases]
+            idx = fresh or idx
+            boost = set(boost or [])
+            weights = [max(1, e["capture_rate"]) * (boost_mult if boost & set(e.get("types", [])) else 1)
                        for e in idx]
             return random.choices(idx, weights=weights, k=1)[0]["id"]
         except Exception:
