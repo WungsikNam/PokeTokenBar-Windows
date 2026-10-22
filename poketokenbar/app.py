@@ -17,7 +17,7 @@ from tkinter import messagebox, ttk
 import pystray
 from PIL import Image, ImageTk
 
-from .companion import (CANDY_XP, GRAD_TOTAL, ITEM_SPRITES, MEGA_SPECIES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
+from .companion import (CANDY_XP, DEX_MAX, GENERATIONS, GRAD_TOTAL, ITEM_SPRITES, MEGA_SPECIES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
                         dex_no, display_name, find_node, roll_hatch, tree_depth)
 from .pokedata import PokeData, egg_image, load_frames
 from .usage import UsageScanner, fmt_tokens
@@ -719,6 +719,8 @@ class App:
         self.running = True
         self.wake = threading.Event()
         self.dex_dirty = True
+        self.dex_page = 0
+        self.dex_filter = tk.StringVar(master=self.root, value="all")
 
         self._style()
         self._build()
@@ -1257,35 +1259,91 @@ class App:
         p = sc.inner
         dex = self.comp.s["dex"]
         grads = self.comp.s["graduates"]
+        owned = {int(k) for k in dex if int(k) <= DEX_MAX}
         tk.Frame(p, bg=C["bg"], height=10).pack()
+
+        # --- 도감 완성도
         c = card(p)
-        lbl(c, f"도감 {len(dex)}종 · 졸업 {len(grads)}마리", 11, True).pack(anchor="w")
-        lbl(c, ("피츄 → 피카츄 → 라이츄를 키워요. 졸업할 때마다 다시 피츄 알이 와요 (재회 보너스로 2배 빨리 자라요)."
-               if self.pikachu_mode else
-               "1~5세대 기본형 328종 중 capture rate 가중치로 부화해요.") + " 셀을 누르면 상세 정보를 볼 수 있어요.",
-            8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w")
+        row = tk.Frame(c, bg=C["card"])
+        row.pack(fill="x")
+        lbl(row, "도감 완성도", 11, True).pack(side="left")
+        lbl(row, f"{len(owned)} / {DEX_MAX}  ({len(owned) / DEX_MAX:.1%})", 11, True,
+            color=C["accent"]).pack(side="right")
+        cv = tk.Canvas(c, width=W(380), height=W(8), highlightthickness=0, bg=C["card"])
+        cv.pack(fill="x", pady=(6, 4))
+        bar(cv, len(owned) / DEX_MAX, C["accent"])
+        gens = tk.Frame(c, bg=C["card"])
+        gens.pack(fill="x")
+        for i, (g, lo, hi) in enumerate(GENERATIONS):
+            n = sum(1 for sid in owned if lo <= sid <= hi)
+            gf = tk.Frame(gens, bg=C["card"])
+            gf.grid(row=0, column=i, sticky="ew", padx=2)
+            lbl(gf, f"{g}세대", 8, color=C["sub"]).pack()
+            lbl(gf, f"{n}/{hi - lo + 1}", 9, True).pack()
+            gens.columnconfigure(i, weight=1)
+        shinies = sum(1 for d in dex.values() if d.get("shiny"))
+        mode = ("피카츄 키우기 모드예요 — 피츄 라인만 부화해요. 설정에서 끄면 랜덤 부화로 도감을 채울 수 있어요."
+                if self.pikachu_mode else
+                "알에서는 1~5세대 기본형 중 하나가 무작위로 태어나요 (흔한 포켓몬일수록 자주, 전설은 드물게). "
+                "키우면서 진화한 모습도 도감에 등록돼요.")
+        lbl(c, f"졸업 {len(grads)}마리 · 이로치 {shinies}종\n{mode}", 8, color=C["sub"],
+            wraplength=W(380), justify="left").pack(anchor="w", pady=(8, 0))
+
+        # --- 페이지 그리드 (원본처럼 한 페이지씩 넘겨 보기)
+        c = card(p)
+        nav = tk.Frame(c, bg=C["card"])
+        nav.pack(fill="x")
+        only_owned = self.dex_filter.get() == "owned"
+        if only_owned:
+            ids = sorted((int(k) for k in dex), key=lambda i: (dex_no(i), i))
+        else:
+            ids = list(range(1, DEX_MAX + 1))
+        per = 20
+        pages = max(1, (len(ids) + per - 1) // per)
+        self.dex_page = max(0, min(self.dex_page, pages - 1))
+        ttk.Button(nav, text="◀", width=3, command=lambda: self._dex_go(self.dex_page - 1)).pack(side="left")
+        lbl(nav, f"{self.dex_page + 1} / {pages}", 9, True).pack(side="left", padx=6)
+        ttk.Button(nav, text="▶", width=3, command=lambda: self._dex_go(self.dex_page + 1)).pack(side="left")
+        for text, val in (("잡은 것만", "owned"), ("전체", "all")):
+            ttk.Radiobutton(nav, text=text, value=val, variable=self.dex_filter,
+                            command=lambda: (setattr(self, "dex_page", 0), self._refresh_dex())).pack(side="right")
+        if not only_owned:
+            jump = tk.Frame(c, bg=C["card"])
+            jump.pack(fill="x", pady=(4, 0))
+            for g, lo, hi in GENERATIONS:
+                ttk.Button(jump, text=f"{g}세대", width=5,
+                           command=lambda lo=lo: self._dex_go((lo - 1) // per)).pack(side="left", padx=(0, 3))
         grid = tk.Frame(c, bg=C["card"])
         grid.pack(fill="x", pady=(8, 0))
         cols = 4
-        for i, (sid, d) in enumerate(sorted(dex.items(), key=lambda kv: int(kv[0]))):
-            sid = int(sid)
-            shiny = d.get("shiny") and not d.get("normal")
-            cell = tk.Frame(grid, bg="#f8f9fa", padx=4, pady=4, cursor="hand2",
-                            highlightbackground=RARITY_COLOR.get(d.get("rarity"), C["line"]), highlightthickness=1)
+        for i, sid in enumerate(ids[self.dex_page * per:(self.dex_page + 1) * per]):
+            d = dex.get(str(sid))
+            if d:
+                shiny = d.get("shiny") and not d.get("normal")
+                cell = tk.Frame(grid, bg="#f8f9fa", padx=4, pady=4, cursor="hand2",
+                                highlightbackground=RARITY_COLOR.get(d.get("rarity"), C["line"]),
+                                highlightthickness=1)
+                im = tk.Label(cell, image=self.photo((sid, bool(shiny)), W(56)), bg="#f8f9fa")
+                marks = ("✨" if d.get("shiny") else "") + (" 졸업" if d.get("graduated") else "")
+                t1 = lbl(cell, f"#{dex_no(sid):03d}{' 메가' if sid in MEGA_SPECIES else ''} {marks}", 7,
+                         color=C["sub"], bg="#f8f9fa")
+                t2 = lbl(cell, display_name(d.get("names"), f"#{sid}"), 9, True, bg="#f8f9fa")
+                for w in (cell, im, t1, t2):
+                    w.bind("<Button-1>", lambda e, sid=sid: self.open_detail(sid))
+            else:
+                cell = tk.Frame(grid, bg="#f1f3f5", padx=4, pady=4,
+                                highlightbackground=C["line"], highlightthickness=1)
+                im = tk.Label(cell, image=self.blank(W(56)), text="?", compound="center",
+                              font=(FONT, 20, "bold"), fg="#ced4da", bg="#f1f3f5")
+                t1 = lbl(cell, f"#{sid:03d}", 7, color="#adb5bd", bg="#f1f3f5")
+                t2 = lbl(cell, "???", 9, True, color="#ced4da", bg="#f1f3f5")
             cell.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="nsew")
-            im = tk.Label(cell, image=self.photo((sid, bool(shiny)), W(64)), bg="#f8f9fa")
-            im.pack()
-            marks = ("✨" if d.get("shiny") else "") + (" 졸업" if d.get("graduated") else "")
-            t1 = lbl(cell, f"#{dex_no(sid):03d}{' 메가' if sid in MEGA_SPECIES else ''} {marks}", 7,
-                     color=C["sub"], bg="#f8f9fa")
+            im.pack(expand=True)
             t1.pack()
-            t2 = lbl(cell, display_name(d.get("names"), f"#{sid}"), 9, True, bg="#f8f9fa")
             t2.pack()
-            for w in (cell, im, t1, t2):
-                w.bind("<Button-1>", lambda e, sid=sid: self.open_detail(sid))
         for col in range(cols):
-            grid.columnconfigure(col, weight=1)
-        if not dex:
+            grid.columnconfigure(col, weight=1, uniform="dex")
+        if only_owned and not dex:
             lbl(grid, "아직 비어 있어요. 첫 알이 부화하면 여기에 등록돼요!", 9, color=C["sub"], bg=C["card"]).grid()
 
         c2 = card(p)
@@ -1301,6 +1359,17 @@ class App:
             lbl(r, f"{RARITY_KO[g['rarity']]} · {g['nature']} · "
                    f"{dt.datetime.fromtimestamp(g['graduated_at']):%y.%m.%d}", 8,
                 color=RARITY_COLOR[g["rarity"]]).pack(side="right")
+
+    def blank(self, size: int):
+        ck = ("blank", size)
+        if ck not in self.photos:
+            self.photos[ck] = ImageTk.PhotoImage(Image.new("RGBA", (size, size), (0, 0, 0, 0)), master=self.root)
+        return self.photos[ck]
+
+    def _dex_go(self, page: int):
+        self.dex_page = page
+        self._refresh_dex()
+        self.tab_dex.canvas.yview_moveto(0)
 
     def open_detail(self, sid: int):
         d = self.comp.s["dex"].get(str(sid), {})

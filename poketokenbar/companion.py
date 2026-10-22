@@ -116,8 +116,11 @@ DEFAULT_SETTINGS = {
     "pet_visible": True, "pet_size": 128, "pet_x": None, "pet_y": None,
     "refresh_min": 2, "growth_difficulty": 1.0, "price_difficulty": 1.0,
     "notify": True, "start_hidden": False, "taskbar_visible": True, "taskbar_cost": False,
-    "taskbar_offset": None, "fixed_base": PIKACHU_BASE,
+    "taskbar_offset": None, "fixed_base": None,  # None = 1~5세대 랜덤 부화, PIKACHU_BASE = 피카츄 키우기
 }
+STATE_VERSION = 2
+DEX_MAX = 649  # 1~5세대
+GENERATIONS = [(1, 1, 151), (2, 152, 251), (3, 252, 386), (4, 387, 493), (5, 494, 649)]
 
 
 class Companion:
@@ -128,7 +131,7 @@ class Companion:
         except (OSError, ValueError):
             self.s = {}
         s = self.s
-        s.setdefault("version", 1)
+        s.setdefault("version", STATE_VERSION if not s else 1)
         s.setdefault("last_total", None)
         s.setdefault("earned", 0)
         s.setdefault("spent", 0)
@@ -143,6 +146,9 @@ class Companion:
         st = s.setdefault("settings", {})
         for k, v in DEFAULT_SETTINGS.items():
             st.setdefault(k, v)
+        if s["version"] < 2:  # v1 은 피카츄 고정이 기본값이었다 → 랜덤 부화(도감 채우기)로 전환
+            st["fixed_base"] = None
+            s["version"] = 2
         if s["active"]:
             add_megas(s["active"]["tree"], s["active"]["names"], str_keys=True)
 
