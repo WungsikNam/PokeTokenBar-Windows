@@ -762,7 +762,8 @@ class App:
         return "피카츄 키우기" if self.pikachu_mode else "PokeTokenBar"
 
     def _set_window_icon(self):
-        img = egg_image(64, pikachu=hasattr(self, "comp") and self.pikachu_mode)
+        from .icon import pikachu_face
+        img = pikachu_face(64)
         self._icon_photo = ImageTk.PhotoImage(img, master=self.root)
         self.root.iconphoto(True, self._icon_photo)
 
