@@ -23,6 +23,15 @@ from urllib.parse import urlsplit
 
 import webview
 
+try:
+    # pywebview 는 팝업(window.open, "Google 로 계속하기" 등)을 기본 브라우저로 넘긴다 → 로그인이 Chrome 에서
+    # 끝나 이 창은 끝내 로그인되지 않는다. 처리하지 않고 두면 WebView2 가 같은 세션의 자체 팝업 창으로 연다.
+    from webview.platforms import edgechromium
+
+    edgechromium.EdgeChrome.on_new_window_request = lambda self, sender, args: None
+except Exception:  # noqa: BLE001 — 다른 백엔드/버전이면 기본 동작 유지
+    pass
+
 LOGIN_URL = "https://claude.ai/login"
 LOG = Path(os.environ.get("APPDATA") or Path.home()) / "PokeTokenBarWin" / "login.log"
 TITLE = "Claude 로그인 — 이메일 로그인은 메일의 '인증 코드'를 이 창에 입력하세요 (링크 클릭 X)"
