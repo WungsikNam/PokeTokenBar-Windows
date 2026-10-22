@@ -607,7 +607,10 @@ class TaskbarWidget:
         if not tb:
             return
         x = self.win.winfo_x()
-        img = ImageGrab.grab(bbox=(max(tb[0], x - W(10)), tb[1] + W(4), max(tb[0] + 1, x - W(2)), tb[3] - W(4)))
+        try:
+            img = ImageGrab.grab(bbox=(max(tb[0], x - W(10)), tb[1] + W(4), max(tb[0] + 1, x - W(2)), tb[3] - W(4)))
+        except OSError:  # 화면 잠금·보안 데스크톱 중에는 캡처가 안 된다 — 다음 샘플링 때 다시 시도
+            return
         colors = img.convert("RGB").getcolors(4096)
         if not colors:
             return
