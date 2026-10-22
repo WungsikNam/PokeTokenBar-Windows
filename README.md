@@ -17,14 +17,26 @@ AI 코딩 도구에 쓴 토큰으로 포켓몬 알을 부화시키고, 진화시
 
 **피카츄 키우기 모드**: 설정 → 키우기 모드에서 켜면 피츄 → 피카츄 → 라이츄 → 메가라이츄 X/Y 라인만 부화해요.
 
-## 실행
+## 설치 (다운로드해서 바로 실행)
 
-`run.bat`을 더블클릭하세요. 의존성(Pillow, pystray)을 설치한 뒤 콘솔 창 없이 실행돼요.
+1. [Releases](https://github.com/WungsikNam/PokeTokenBar-Windows/releases/latest)에서 **`PokeTokenBar.exe`**를 받아요. Python은 필요 없어요.
+2. 원하는 폴더(예: `문서\PokeTokenBar`)에 넣고 더블클릭해요.
+   - "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누르세요. 서명하지 않은 개인 프로젝트라서 뜨는 경고예요.
+3. 작업 표시줄 오른쪽에 알이 나타나면 끝이에요. 홈 화면의 **Claude 로그인**을 하면 Claude 채팅 사용량도 반영돼요.
+4. Windows를 켤 때 자동으로 실행하려면 설정 → "Windows 시작 시 자동 실행"을 켜세요.
+
+- 데이터(포켓몬, 도감, 설정)는 PC마다 `%APPDATA%\PokeTokenBarWin`에 따로 저장돼요.
+- 필요 조건: Windows 10/11. 로그인 창은 Windows에 기본으로 들어 있는 Edge WebView2를 써요.
+
+### 소스에서 실행 (개발용)
 
 ```
-python -m pip install -r requirements.txt
-pythonw PokeTokenBar.pyw
+git clone https://github.com/WungsikNam/PokeTokenBar-Windows.git
+cd PokeTokenBar-Windows
+run.bat
 ```
+
+exe를 직접 빌드하려면 `pip install pyinstaller` 후 `python build_exe.py`를 실행하세요. `dist\PokeTokenBar.exe`가 만들어져요.
 
 ## 표시되는 곳
 

@@ -1,12 +1,14 @@
 """Claude 로그인 창 (별도 프로세스로 실행: python -m poketokenbar.login).
 
 Windows 내장 Edge WebView2 로 claude.ai 로그인 페이지를 띄우고, 사용자가 로그인하면
-sessionKey 쿠키를 표준 출력(JSON 한 줄)으로 부모 앱에 넘긴 뒤 창을 닫는다.
+sessionKey 쿠키를 (--out 파일 또는 표준 출력으로) 부모 앱에 넘긴 뒤 창을 닫는다.
 비공개 모드라 로그인 정보가 이 창의 프로필에 남지 않는다.
 
 진단용으로 %APPDATA%\\PokeTokenBarWin\\login.log 에 페이지 주소(쿼리 제외)와 쿠키 '이름'만 남긴다 (값은 남기지 않음).
 
 --probe: 로그인 없이 페이지를 열어 쿠키 읽기가 동작하는지만 확인 (쿠키 이름만 출력).
+--out <파일>: 결과를 표준 출력 대신 이 파일에 쓴다 (exe 로 묶으면 창 모드라 stdout 이 없다).
+  세션 키는 DPAPI 로 암호화한 값만 쓴다.
 """
 from __future__ import annotations
 
@@ -47,13 +49,23 @@ def _is_session_cookie(name: str) -> bool:
 
 def main():
     probe = "--probe" in sys.argv
+    out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None
     win = webview.create_window(TITLE, LOGIN_URL, width=520, height=780)
     done = threading.Event()
     log("login window opened")
 
     def emit(obj):
-        sys.stdout.write(json.dumps(obj) + "\n")
-        sys.stdout.flush()
+        if out:
+            if "sessionKey" in obj:
+                from .claude_live import protect
+                obj = {"sessionKeyEnc": protect(obj["sessionKey"])}
+            tmp = out + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(obj, f)
+            os.replace(tmp, out)
+        elif sys.stdout:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.stdout.flush()
 
     def watch():
         deadline = time.time() + (20 if probe else 30 * 60)

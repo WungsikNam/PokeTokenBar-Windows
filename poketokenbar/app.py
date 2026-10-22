@@ -1808,12 +1808,16 @@ class App:
         """WebView2 로그인 창(별도 프로세스)을 띄우고, 로그인되면 세션 키를 받아 연결한다."""
         if getattr(self, "_login_proc", None) and self._login_proc.poll() is None:
             return  # 이미 열려 있음
-        exe = Path(sys.executable)
-        py = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
+        out = APP_DIR / "login_result.json"
+        out.unlink(missing_ok=True)
+        if getattr(sys, "frozen", False):  # exe: 같은 exe 를 로그인 모드로
+            cmd = [sys.executable, "--login", "--out", str(out)]
+        else:
+            cmd = [sys.executable, "-m", "poketokenbar.login", "--out", str(out)]
         try:
             self._login_proc = subprocess.Popen(
-                [str(py), "-m", "poketokenbar.login"], cwd=str(Path(__file__).resolve().parent.parent),
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+                cmd, cwd=str(Path(__file__).resolve().parent.parent),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
             self._update_live_label(f"로그인 창을 열 수 없어요: {e}", False)
             return
@@ -1821,13 +1825,14 @@ class App:
         proc = self._login_proc
 
         def work():
-            key = None
-            for line in proc.stdout:
-                try:
-                    key = json.loads(line).get("sessionKey") or key
-                except ValueError:
-                    pass
             proc.wait()
+            key = None
+            try:
+                enc = json.loads(out.read_text(encoding="utf-8")).get("sessionKeyEnc")
+                key = claude_live.unprotect(enc) if enc else None
+            except (OSError, ValueError):
+                pass
+            out.unlink(missing_ok=True)
             if not key:
                 self.post(self._update_live_label, "로그인을 마치지 않고 창을 닫았어요", None)
                 return
