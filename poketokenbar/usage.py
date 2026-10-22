@@ -200,6 +200,41 @@ def _codex_roots() -> list[Path]:
     return [r for r in (base / "sessions", base / "archived_sessions") if r.is_dir()]
 
 
+def _plan_history_paths() -> list[Path]:
+    """Claude 데스크톱 앱이 기록하는 플랜 사용률 파일 (5시간/주간 %, 채팅·Cowork·Claude Code 모두 포함)."""
+    out = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        out += [Path(p) for p in glob.glob(os.path.join(local, "Claude-Data", "*", "plan-usage-history.json"))]
+    roaming = os.environ.get("APPDATA")
+    if roaming:
+        p = Path(roaming) / "Claude" / "plan-usage-history.json"
+        if p.exists():
+            out.append(p)
+    return out
+
+
+def read_plan_history() -> list[tuple[float, str, int, int]]:
+    """[(초 단위 시각, org, 5시간 %, 주간 %)] 시간순. 가장 최근 샘플의 조직(org)만 남긴다."""
+    rows = []
+    for p in _plan_history_paths():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for x in data.get("samples", []):
+            u = x.get("u") or {}
+            if "sd" not in u:
+                continue
+            t = x["t"] / 1000 if x["t"] > 1e11 else x["t"]
+            rows.append((t, x.get("org", ""), int(u.get("fh") or 0), int(u.get("sd") or 0)))
+    rows.sort()
+    if rows:
+        org = rows[-1][1]
+        rows = [r for r in rows if r[1] == org]
+    return rows
+
+
 @dataclass
 class UsageSummary:
     today_total: int = 0
@@ -211,6 +246,15 @@ class UsageSummary:
     codex_limits: dict | None = None
     providers_found: list = field(default_factory=list)
     scanned_at: float = 0.0
+    claude_events: list = field(default_factory=list)  # [(ts, tokens)] 최근 15일 Claude Code, 시간순
+    plan_history: list = field(default_factory=list)   # read_plan_history() 결과
+
+    def claude_tokens_between(self, t0: float, t1: float) -> int:
+        import bisect
+        ev = self.claude_events
+        i = bisect.bisect_right(ev, (t0, float("inf")))
+        j = bisect.bisect_right(ev, (t1, float("inf")))
+        return sum(t for _, t in ev[i:j])
 
 
 class UsageScanner:
@@ -308,6 +352,10 @@ class UsageScanner:
         s.daily = [(d, v[0], v[1]) for d, v in sorted(daily.items())]
         s.codex_limits = limits["data"] if limits else None
         s.scanned_at = dt.datetime.now().timestamp()
+        cut = s.scanned_at - 15 * 86400
+        s.claude_events = sorted((e[0], e[3]) for e in list(keyed.values()) + plain
+                                 if e[1] == "claude" and e[0] >= cut)
+        s.plan_history = read_plan_history()
         return s
 
 

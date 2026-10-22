@@ -809,6 +809,11 @@ class App:
             return []
         return wx.boost_types(self.weather)
 
+    def today_total(self) -> int:
+        s = self.summary
+        extra = self.comp.claude_app_today() if self.comp.settings.get("claude_app", True) else 0
+        return (s.today_total if s else 0) + extra
+
     def refresh_now(self):
         self.wake.set()
 
@@ -818,6 +823,9 @@ class App:
         if not self.comp.s.get("calibrated"):
             self.calibrate(silent=True)
         events = self.comp.ingest_total(s.all_time_total)
+        if self.comp.settings.get("claude_app", True):
+            _, ev2 = self.comp.ingest_plan_usage(s)
+            events += ev2
         self.comp.save()
         self.handle_events(events)
         self.maybe_hatch()
@@ -990,7 +998,7 @@ class App:
             head = f"알 ({min(1, self.comp.egg['progress'] / thr):.0%})"
         s = self.summary
         if s:
-            return f"{head}\n오늘 {fmt_tokens(s.today_total)} 토큰 · ${s.today_cost:,.2f}"
+            return f"{head}\n오늘 {fmt_tokens(self.today_total())} 토큰 · ${s.today_cost:,.2f}"
         return head + "\n사용량 읽는 중…"
 
     # ---------- 화면 갱신
@@ -1002,7 +1010,7 @@ class App:
         tsz = self.taskbar.sprite_size()
         tframes, tdurs = self.frames_for(key, tsz)
         s = self.summary
-        ttext = fmt_tokens(s.today_total) if s else "…"
+        ttext = fmt_tokens(self.today_total()) if s else "…"
         if s and self.comp.settings.get("taskbar_cost"):
             ttext += f"\n${s.today_cost:,.2f}"
         self.taskbar.update((key, tsz), tframes, tdurs, ttext)
@@ -1252,19 +1260,37 @@ class App:
         if not s:
             return
         self.l_updated.configure(text=f"업데이트 {dt.datetime.fromtimestamp(s.scanned_at):%H:%M}")
-        self.h_today.configure(text=f"{fmt_tokens(s.today_total)} 토큰")
+        self.h_today.configure(text=f"{fmt_tokens(self.today_total())} 토큰")
         self.h_cost.configure(text=f"API 환산 ${s.today_cost:,.2f}")
         if not s.providers_found:
             lbl(self.h_prov, "Claude Code / Codex 로그를 찾지 못했어요.", 9, color=C["accent"]).pack(anchor="w")
-        for m, t in sorted(s.today_by_model.items(), key=lambda kv: -kv[1])[:6]:
+        rows = sorted(s.today_by_model.items(), key=lambda kv: -kv[1])[:6]
+        app_today = self.comp.claude_app_today() if self.comp.settings.get("claude_app", True) else 0
+        if app_today:
+            rows.append(("Claude 앱 (채팅·Cowork, 사용률 환산)", app_today))
+        for m, t in rows:
             r = tk.Frame(self.h_prov, bg=C["card"])
             r.pack(fill="x")
             lbl(r, m, 9, color=C["sub"]).pack(side="left")
-            lbl(r, fmt_tokens(t), 9).pack(side="right")
+            lbl(r, ("≈" if m.startswith("Claude 앱") else "") + fmt_tokens(t), 9).pack(side="right")
         self._draw_chart()
+        shown = False
+        # Claude 플랜 사용률 (Claude 데스크톱 앱 기록)
+        if s.plan_history:
+            t, _, fh, sd = s.plan_history[-1]
+            age = time.time() - t
+            when = "" if age < 3600 else f" · {dt.datetime.fromtimestamp(t):%m/%d %H:%M} 기준"
+            for name, pct in (("Claude 5시간", fh), ("Claude 주간", sd)):
+                shown = True
+                r = tk.Frame(self.h_limits, bg=C["card"])
+                r.pack(fill="x", pady=(6, 0))
+                lbl(r, name, 9).pack(side="left")
+                lbl(r, f"{pct}%{when}", 9, color=C["sub"]).pack(side="right")
+                cv = tk.Canvas(self.h_limits, width=W(380), height=W(6), highlightthickness=0, bg=C["card"])
+                cv.pack(fill="x", pady=(2, 0))
+                bar(cv, pct / 100, C["accent"] if pct >= 90 else "#fab005" if pct >= 70 else "#40c057")
         # Codex 한도 (로그에 기록됨)
         lim = s.codex_limits
-        shown = False
         if lim:
             for k in ("primary", "secondary"):
                 w = lim.get(k)
@@ -1283,7 +1309,7 @@ class App:
                 cv.pack(fill="x", pady=(2, 0))
                 bar(cv, pct / 100, C["accent"] if pct >= 90 else "#fab005" if pct >= 70 else "#40c057")
         if not shown:
-            lbl(self.h_limits, "Codex 로그에 한도 정보가 없어요. (Claude 공식 한도는 아직 미지원)", 9,
+            lbl(self.h_limits, "한도 정보가 없어요. Claude 데스크톱 앱이나 Codex를 쓰면 여기에 보여요.", 9,
                 color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w")
 
     def _draw_chart(self):
@@ -1577,6 +1603,16 @@ class App:
         ttk.Checkbutton(c, text="피카츄만 키우기 (피츄 → 피카츄 → 라이츄)", variable=self.v_pika,
                         command=lambda: self.set_pikachu(self.v_pika.get())).pack(anchor="w", pady=(4, 0))
         lbl(c, "끄면 원본처럼 1~5세대 포켓몬이 무작위로 부화해요.", 8, color=C["sub"]).pack(anchor="w", pady=(4, 0))
+
+        c = card(p)
+        lbl(c, "Claude 앱 사용량", 11, True).pack(anchor="w")
+        self.v_capp = tk.BooleanVar(value=st.get("claude_app", True))
+        ttk.Checkbutton(c, text="Claude 앱(채팅·Cowork) 사용분도 포켓몬 성장에 반영",
+                        variable=self.v_capp,
+                        command=lambda: self._set("claude_app", self.v_capp.get())).pack(anchor="w", pady=(4, 0))
+        lbl(c, "채팅은 토큰 수가 PC에 남지 않아서, Claude 데스크톱 앱이 기록하는 주간 플랜 사용률(%)이 오른 만큼을 "
+               "토큰으로 환산해요. Claude Code로 이미 센 만큼은 빼서 두 번 세지 않아요.",
+            8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(4, 0))
 
         c = card(p)
         lbl(c, "날씨", 11, True).pack(anchor="w")

@@ -326,6 +326,58 @@ class Companion:
         self.s["earned"] += delta
         return self.feed(delta)
 
+    # ---------- Claude 앱(채팅·Cowork) 사용분 ----------
+    def tokens_per_plan_percent(self, summary) -> float:
+        """주간 플랜 사용률 1% ≈ 몇 토큰인지 — 최근 기록에서 'Claude Code 토큰 / 사용률 증가'로 추정."""
+        h = summary.plan_history
+        ratios = []
+        for a, b in zip(h, h[1:]):
+            d = b[3] - a[3]
+            if d <= 0 or b[0] - a[0] > 3 * 3600:
+                continue
+            code = summary.claude_tokens_between(a[0], b[0])
+            if code > 0:
+                ratios.append(code / d)
+        if len(ratios) < 3:
+            return 800_000.0
+        ratios.sort()
+        k = ratios[int(len(ratios) * 0.75)]  # 채팅이 섞인 구간은 비율이 낮게 나오므로 상위값 사용
+        return max(200_000.0, min(5_000_000.0, k))
+
+    def ingest_plan_usage(self, summary) -> tuple[int, list]:
+        """주간 사용률이 오른 만큼을 토큰으로 환산해, Claude Code 토큰으로 이미 센 부분을 뺀 나머지를 먹인다."""
+        h = summary.plan_history
+        if not h:
+            return 0, []
+        last_t = self.s.get("plan_last_t")
+        self.s["plan_last_t"] = h[-1][0]
+        if last_t is None:
+            return 0, []
+        k = self.tokens_per_plan_percent(summary)
+        extra_total = 0
+        daily = self.s.setdefault("claude_app_daily", {})
+        for a, b in zip(h, h[1:]):
+            if b[0] <= last_t:
+                continue
+            d = b[3] - a[3] if b[3] >= a[3] else b[3]  # 줄었으면 주간 리셋 → 리셋 후 사용분
+            if d <= 0:
+                continue
+            code = summary.claude_tokens_between(a[0], b[0])
+            extra = int(max(0.0, k * d - code))
+            if extra:
+                extra_total += extra
+                day = time.strftime("%Y-%m-%d", time.localtime(b[0]))
+                daily[day] = daily.get(day, 0) + extra
+        for day in sorted(daily)[:-31]:
+            del daily[day]
+        if not extra_total:
+            return 0, []
+        self.s["earned"] += extra_total
+        return extra_total, self.feed(extra_total)
+
+    def claude_app_today(self) -> int:
+        return self.s.get("claude_app_daily", {}).get(time.strftime("%Y-%m-%d"), 0)
+
     def feed(self, n: int) -> list:
         events = []
         a = self.active
