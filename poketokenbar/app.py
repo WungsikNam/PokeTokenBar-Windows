@@ -17,8 +17,8 @@ from tkinter import messagebox, ttk
 import pystray
 from PIL import Image, ImageTk
 
-from .companion import (CANDY_XP, GRAD_TOTAL, ITEM_SPRITES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
-                        display_name, find_node, roll_hatch, tree_depth)
+from .companion import (CANDY_XP, GRAD_TOTAL, ITEM_SPRITES, MEGA_SPECIES, PIKACHU_BASE, RARITY_COLOR, RARITY_KO, SHOP_ITEMS, Companion,
+                        dex_no, display_name, find_node, roll_hatch, tree_depth)
 from .pokedata import PokeData, egg_image, load_frames
 from .usage import UsageScanner, fmt_tokens
 
@@ -415,6 +415,31 @@ def _weather_widget_near_tray() -> bool:
     return vals.get("TaskbarAl", 1) == 0 and vals.get("TaskbarDa", 1) != 0
 
 
+def _force_foreground(hwnd: int):
+    u, k = ctypes.windll.user32, ctypes.windll.kernel32
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    fg = u.GetForegroundWindow()
+    fg_tid = u.GetWindowThreadProcessId(ctypes.c_void_p(fg), None) if fg else 0
+    my_tid = k.GetCurrentThreadId()
+    attached = bool(fg_tid and fg_tid != my_tid and u.AttachThreadInput(fg_tid, my_tid, True))
+    try:
+        u.ShowWindow(ctypes.c_void_p(hwnd), 9)  # SW_RESTORE
+        u.BringWindowToTop(ctypes.c_void_p(hwnd))
+        u.SetForegroundWindow(ctypes.c_void_p(hwnd))
+    finally:
+        if attached:
+            u.AttachThreadInput(fg_tid, my_tid, False)
+
+
+def _main_is_foreground(app) -> bool:
+    u = ctypes.windll.user32
+    u.GetForegroundWindow.restype = ctypes.c_void_p
+    try:
+        return app.root.state() == "normal" and u.GetForegroundWindow() == int(app.root.wm_frame(), 16)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _win_rect(hwnd):
     import ctypes.wintypes as wt
     r = wt.RECT()
@@ -425,22 +450,24 @@ def _win_rect(hwnd):
 class TaskbarWidget:
     """작업 표시줄 위(트레이 바로 왼쪽)에 얹는 미니 위젯 — macOS 메뉴바의 '스프라이트 + 오늘 토큰' 표시.
 
-    Windows 트레이 아이콘엔 글자를 붙일 수 없어서, 투명 배경의 항상-위 창을 작업 표시줄 위에 겹쳐 띄운다.
-    투명 키 색을 작업 표시줄 색에 가깝게 잡아 글자 안티앨리어싱 테두리가 티 나지 않게 한다.
+    Windows 트레이 아이콘엔 글자를 붙일 수 없어서, 항상-위 창을 작업 표시줄 위에 겹쳐 띄운다.
+    투명 키 색을 쓰면 글자 사이 빈 곳의 클릭이 뒤로 빠지므로, 대신 작업 표시줄 색을 화면에서 샘플링해
+    불투명 배경으로 칠한다 (주기적으로 다시 샘플링해 테마/배경 변화에 맞춘다).
     """
 
     def __init__(self, app: "App"):
         self.app = app
         light = _taskbar_light()
-        self.KEY = "#eeeeef" if light else "#1d1d1e"
-        self.KEY_RGB = (0xEE, 0xEE, 0xEF) if light else (0x1D, 0x1D, 0x1E)
+        self.KEY_RGB = (0xEE, 0xEE, 0xEE) if light else (0x1F, 0x1F, 0x1F)
+        self.KEY = "#%02x%02x%02x" % self.KEY_RGB
         fg = "#1b1b1b" if light else "#ffffff"
         self.win = tk.Toplevel(app.root)
         self.win.title("PokeTokenBar Taskbar")
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-        self.win.attributes("-transparentcolor", self.KEY)
         self.win.configure(bg=self.KEY)
+        self._frames, self._durs = [], []
+        self._ticks = 0
         self.sprite = tk.Label(self.win, bg=self.KEY, bd=0, highlightthickness=0, cursor="hand2")
         self.sprite.pack(side="left")
         self.text = tk.Label(self.win, bg=self.KEY, fg=fg, font=(FONT, 10, "bold"), bd=0, justify="left",
@@ -474,6 +501,7 @@ class TaskbarWidget:
     def _press(self, e):
         self._hide_tip()
         self._drag = (e.x_root, self.offset(), False)
+        self.app._fg_before_click = getattr(self, "_main_fg_snapshot", False)
 
     def _motion(self, e):
         if not self._drag:
@@ -529,8 +557,13 @@ class TaskbarWidget:
         return l <= 0 and t <= 0 and r >= u.GetSystemMetrics(0) and b >= u.GetSystemMetrics(1)
 
     def _tick(self):
+        # 클릭 순간엔 위젯이 포그라운드를 가져가므로, 클릭 직전 상태를 틱마다 기억해 둔다
+        self._main_fg_snapshot = _main_is_foreground(self.app)
+        self._ticks += 1
         try:
             self._reposition()
+            if self._ticks % 10 == 1:
+                self._sample_bg()
         except Exception:  # noqa: BLE001
             log_error(traceback.format_exc())
         if self.app.running:
@@ -560,9 +593,36 @@ class TaskbarWidget:
         ctypes.windll.user32.SetWindowPos(ctypes.c_void_p(self.hwnd), ctypes.c_void_p(-1), 0, 0, 0, 0,
                                           0x0001 | 0x0002 | 0x0010)
 
+    def _sample_bg(self):
+        """위젯 바로 왼쪽 작업 표시줄 띠에서 가장 흔한 색을 배경색으로 쓴다."""
+        if not self.visible or self.win.state() == "withdrawn":
+            return
+        from PIL import ImageGrab
+        tb = self._taskbar()
+        if not tb:
+            return
+        x = self.win.winfo_x()
+        img = ImageGrab.grab(bbox=(max(tb[0], x - W(10)), tb[1] + W(4), max(tb[0] + 1, x - W(2)), tb[3] - W(4)))
+        colors = img.convert("RGB").getcolors(4096)
+        if not colors:
+            return
+        rgb = max(colors)[1]
+        if max(abs(a - b) for a, b in zip(rgb, self.KEY_RGB)) <= 2:
+            return
+        self.KEY_RGB = rgb
+        self.KEY = "#%02x%02x%02x" % rgb
+        lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+        for w in (self.win, self.sprite, self.text):
+            w.configure(bg=self.KEY)
+        self.text.configure(fg="#1b1b1b" if lum > 128 else "#ffffff")
+        key, self.key = self.key, None
+        if self._frames:
+            self.update(key, self._frames, self._durs, self.text["text"])
+
     def update(self, key, frames, durs, text):
         if key != self.key:
             self.key = key
+            self._frames, self._durs = frames, durs
             photos = []
             for f in frames:
                 bg = Image.new("RGBA", f.size, self.KEY_RGB + (255,))
@@ -770,8 +830,11 @@ class App:
                 title = "✨ 색이 다른 포켓몬이 태어났어요!" if shiny else "알이 부화했어요!"
                 msg = f"{josa(name, '이/가')} 태어났어요! ({RARITY_KO[rarity]})"
             elif kind == "evolve":
-                _, a, b = ev
-                title, msg = "진화!", f"축하해요! {josa(a, '은/는')} {josa(b, '으로/로')} 진화했어요!"
+                a, b = ev[1], ev[2]
+                if len(ev) > 3 and ev[3] in MEGA_SPECIES:
+                    title, msg = "메가진화!", f"{josa(a, '은/는')} {josa(b, '으로/로')} 메가진화했어요!"
+                else:
+                    title, msg = "진화!", f"축하해요! {josa(a, '은/는')} {josa(b, '으로/로')} 진화했어요!"
             elif kind == "graduate":
                 _, name, rarity = ev
                 title, msg = "졸업!", f"{josa(name, '이/가')} 도감에 등록됐어요. 새 알이 도착했어요."
@@ -902,9 +965,19 @@ class App:
 
     # ---------- 창
     def show_main(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+        r = self.root
+        r.deiconify()
+        if r.state() == "iconic":
+            r.state("normal")
+        r.lift()
+        # Windows 는 백그라운드 앱의 창 활성화를 막으므로, 잠깐 최상위로 올리고 포그라운드를 강제한다
+        r.attributes("-topmost", True)
+        try:
+            _force_foreground(int(r.wm_frame(), 16))
+        except Exception:  # noqa: BLE001
+            log_error(traceback.format_exc())
+        r.focus_force()
+        r.after(300, lambda: r.attributes("-topmost", False))
 
     def hide_main(self):
         self.root.withdraw()
@@ -928,10 +1001,11 @@ class App:
         self.refresh_all()
 
     def toggle_main(self):
-        if self.root.state() == "withdrawn":
-            self.show_main()
-        else:
+        # 위젯 클릭 직전에 메인 창이 맨 앞에 있었으면 숨기고, 아니면(숨김/다른 창 뒤) 앞으로 가져온다
+        if self.root.state() == "normal" and getattr(self, "_fg_before_click", False):
             self.hide_main()
+        else:
+            self.show_main()
 
     def set_setting(self, key, value):
         self.comp.settings[key] = value
@@ -1069,7 +1143,7 @@ class App:
         if a:
             name = comp.name_of(a["current_id"])
             self.h_name.configure(text=name + ("  ✨" if a["shiny"] else ""))
-            meta = f"{RARITY_KO[a['rarity']]} · 성격 {a['nature']} · #{a['current_id']:03d}"
+            meta = f"{RARITY_KO[a['rarity']]} · 성격 {a['nature']} · #{dex_no(a['current_id']):03d}"
             if a.get("growth_mult", 1) > 1:
                 meta += " · 재회 보너스 2× 성장"
             self.h_meta.configure(text=meta, fg=RARITY_COLOR[a["rarity"]])
@@ -1202,7 +1276,8 @@ class App:
             im = tk.Label(cell, image=self.photo((sid, bool(shiny)), W(64)), bg="#f8f9fa")
             im.pack()
             marks = ("✨" if d.get("shiny") else "") + (" 졸업" if d.get("graduated") else "")
-            t1 = lbl(cell, f"#{sid:03d} {marks}", 7, color=C["sub"], bg="#f8f9fa")
+            t1 = lbl(cell, f"#{dex_no(sid):03d}{' 메가' if sid in MEGA_SPECIES else ''} {marks}", 7,
+                     color=C["sub"], bg="#f8f9fa")
             t1.pack()
             t2 = lbl(cell, display_name(d.get("names"), f"#{sid}"), 9, True, bg="#f8f9fa")
             t2.pack()
@@ -1244,7 +1319,7 @@ class App:
             anim.set(top._photos, durs)
         show()
         names = d.get("names") or {}
-        lbl(top, f"#{sid:03d}  {display_name(names)}", 15, True).pack()
+        lbl(top, f"#{dex_no(sid):03d}  {display_name(names)}", 15, True).pack()
         lbl(top, f"{names.get('en', '')}  {names.get('ja-Hrkt') or names.get('ja') or ''}", 9,
             color=C["sub"]).pack()
         lbl(top, f"{RARITY_KO.get(d.get('rarity'), '')} · 키운 횟수 {d.get('count', 0)}"
@@ -1257,7 +1332,7 @@ class App:
 
         def load():
             try:
-                spd = self.pd.species(sid)
+                spd = self.pd.species(dex_no(sid))
                 text = (f"{spd.get('genus') or ''}\n\n{spd.get('flavor') or ''}").strip()
             except Exception:  # noqa: BLE001
                 text = "설명을 불러오지 못했어요."

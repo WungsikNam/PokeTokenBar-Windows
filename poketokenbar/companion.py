@@ -66,7 +66,33 @@ def display_name(names: dict | None, fallback="???") -> str:
     return names.get("ko") or names.get("en") or fallback
 
 
-PIKACHU_BASE = 172  # 피츄 → 피카츄 → 라이츄
+PIKACHU_BASE = 172  # 피츄 → 피카츄 → 라이츄 → 메가라이츄 X/Y
+
+# 메가진화 — 최종 진화 뒤에 붙는 추가 단계 (PokéAPI pokemon id → 원래 종 id, 이름).
+# 메가라이츄 X/Y 는 Pokémon Legends: Z-A 「메가 디멘션」에서 추가됐다. PokéAPI 에 한국어 이름이 없어 직접 둔다.
+MEGA_FORMS = {
+    26: [(10304, {"ko": "메가라이츄 X", "en": "Mega Raichu X"}),
+         (10305, {"ko": "메가라이츄 Y", "en": "Mega Raichu Y"})],
+}
+MEGA_SPECIES = {mid: base for base, forms in MEGA_FORMS.items() for mid, _ in forms}
+
+
+def dex_no(sid: int) -> int:
+    """도감 번호 — 메가 폼은 원래 종 번호로 표시."""
+    return MEGA_SPECIES.get(sid, sid)
+
+
+def add_megas(node: dict, names: dict, str_keys: bool) -> bool:
+    """트리의 최종 진화에 메가진화 단계를 붙인다. 바뀌었으면 True."""
+    changed = False
+    if node["id"] in MEGA_FORMS and not node["children"]:
+        for mid, n in MEGA_FORMS[node["id"]]:
+            node["children"].append({"id": mid, "children": []})
+            names[str(mid) if str_keys else mid] = n
+        changed = True
+    for c in node["children"]:
+        changed = add_megas(c, names, str_keys) or changed
+    return changed
 
 
 def roll_hatch(pd, collected_bases: set[int], tier: str | None, shiny_charm: bool,
@@ -78,6 +104,7 @@ def roll_hatch(pd, collected_bases: set[int], tier: str | None, shiny_charm: boo
     tree = pd.chain(sp["chain"])
     node = find_node(tree, base) or tree
     names = {sid: pd.species(sid)["names"] for sid in tree_ids(node)}
+    add_megas(node, names, str_keys=False)
     shiny = random.randrange(48 if shiny_charm else 64) == 0
     for sid in tree_ids(node):
         pd.ensure_sprite(sid, shiny)
@@ -116,6 +143,8 @@ class Companion:
         st = s.setdefault("settings", {})
         for k, v in DEFAULT_SETTINGS.items():
             st.setdefault(k, v)
+        if s["active"]:
+            add_megas(s["active"]["tree"], s["active"]["names"], str_keys=True)
 
     # ---------- 저장 ----------
     def save(self):
@@ -195,7 +224,7 @@ class Companion:
                 a["stage_index"] += 1
                 a["path"].append(child["id"])
                 self._register_dex(child["id"], a)
-                events.append(("evolve", self.name_of(old, a), self.name_of(child["id"], a)))
+                events.append(("evolve", self.name_of(old, a), self.name_of(child["id"], a), child["id"]))
             else:
                 leftover = a["progress"] - thr
                 events.append(("graduate", self.name_of(a["current_id"], a), a["rarity"]))
