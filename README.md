@@ -37,6 +37,7 @@ pythonw PokeTokenBar.pyw
 
 - Claude Code: `~/.claude/projects/**/*.jsonl` (`CLAUDE_CONFIG_DIR` 지원)
 - Codex: `~/.codex/sessions/**/*.jsonl` (`CODEX_HOME` 지원). 로그에 남은 사용 한도도 표시해요.
+- Claude 채팅·데스크톱 앱·Cowork: 홈 화면이나 설정에서 **Claude 로그인**을 하면 2분마다 공식 플랜 사용률(5시간/주간)을 받아와요. 사용률이 오른 만큼을 토큰으로 환산해 성장에 반영하고, Claude Code로 이미 센 만큼은 빼요. 로그인 정보는 Windows DPAPI로 암호화해서 이 PC에만 저장해요. 로그인하지 않으면 Claude 데스크톱 앱이 하루에 한 번 남기는 기록으로만 반영돼요.
 - 포켓몬 데이터와 스프라이트: PokéAPI (처음 받은 뒤에는 캐시에서 읽어요)
 
 앱 데이터는 `%APPDATA%\PokeTokenBarWin`에 저장돼요(`state.json`, 캐시, `error.log`).

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import datetime as dt
 import os
 import queue
@@ -150,6 +151,7 @@ class Tray:
             pystray.MenuItem("데스크톱 펫", lambda: a.post(a.toggle_pet),
                              checked=lambda item: a.comp.settings["pet_visible"]),
             pystray.MenuItem("지금 새로고침", lambda: a.refresh_now()),
+            pystray.MenuItem("Claude 로그인", lambda: a.post(a.claude_login)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", lambda: a.post(a.quit)),
         )
@@ -787,8 +789,13 @@ class App:
                 if key and self.comp.settings.get("claude_app", True):
                     try:
                         live = claude_live.fetch_usage(key, (self.comp.s.get("live") or {}).get("org"))
+                        self.live_auth_failed = False
                     except claude_live.LiveError as e:
                         live_err = str(e)
+                        if e.auth and not getattr(self, "live_auth_failed", False):
+                            self.live_auth_failed = True
+                            self.tray.notify("Claude 로그인이 만료됐어요",
+                                             "앱을 열어 다시 로그인하면 사용량 반영을 이어가요.")
                 self.post(self.on_summary, s, live, live_err)
             except Exception:  # noqa: BLE001
                 log_error(traceback.format_exc())
@@ -1164,6 +1171,13 @@ class App:
     def _build_home(self):
         p = self.tab_home.inner
         tk.Frame(p, bg=C["bg"], height=10).pack()
+        self.h_login = tk.Frame(p, bg="#fff4e6", highlightbackground="#ffa94d", highlightthickness=1,
+                                padx=12, pady=8)
+        self.h_login_text = lbl(self.h_login, "", 9, color="#d9480f", bg="#fff4e6", wraplength=W(300),
+                                justify="left")
+        self.h_login_text.pack(side="left", fill="x", expand=True)
+        ttk.Button(self.h_login, text="Claude 로그인", style="Accent.TButton",
+                   command=self.claude_login).pack(side="right")
         self.h_weather = lbl(p, "", 9, color="#1971c2", wraplength=W(400), justify="left")
         self.h_weather.pack(fill="x", padx=W(14), pady=(0, 6))
         c1 = card(p)
@@ -1210,6 +1224,18 @@ class App:
 
     def _refresh_home(self):
         comp, a = self.comp, self.comp.active
+        need = None
+        if comp.settings.get("claude_app", True):
+            if not comp.s.get("session_key_enc"):
+                need = "Claude에 로그인하면 채팅·데스크톱 앱·Cowork 사용량도 실시간으로 포켓몬 성장에 반영돼요."
+            elif getattr(self, "live_auth_failed", False):
+                need = "Claude 로그인이 만료됐어요. 다시 로그인하면 사용량 반영을 이어가요."
+        if need:
+            self.h_login_text.configure(text=need)
+            if not self.h_login.winfo_ismapped():
+                self.h_login.pack(fill="x", padx=12, pady=(0, 8), before=self.h_weather)
+        elif self.h_login.winfo_ismapped():
+            self.h_login.pack_forget()
         if self.pikachu_mode:
             self.h_weather.configure(text="피카츄 키우기 모드 — 날씨와 상관없이 피츄가 태어나요")
         elif not comp.settings.get("weather_boost", True):
@@ -1645,22 +1671,23 @@ class App:
         lbl(c, "채팅·데스크톱 앱·Cowork 는 토큰 수가 PC에 남지 않아서, Claude 플랜 사용률(%)이 오른 만큼을 토큰으로 "
                "환산해요. Claude Code로 이미 센 만큼은 빼서 두 번 세지 않아요.",
             8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(4, 0))
-        lbl(c, "실시간 연동 (claude.ai 세션 키)", 10, True).pack(anchor="w", pady=(10, 0))
-        lbl(c, "세션 키를 넣으면 2분마다 공식 사용률을 받아와, Claude 를 쓰는 만큼 바로 자라요. "
-               "넣지 않으면 데스크톱 앱이 하루 한 번 남기는 기록만 써서 하루 늦게 반영돼요.\n"
-               "받는 법: 브라우저에서 claude.ai 로그인 → F12 → Application(애플리케이션) → Cookies → "
-               "https://claude.ai → sessionKey 값 복사 → 아래에 붙여넣기\n"
-               "세션 키는 계정 접근 권한이 있으니 다른 사람과 공유하지 마세요. 이 앱은 Windows 암호화(DPAPI)로 "
-               "이 PC에만 저장하고 claude.ai 로만 보내요.",
+        lbl(c, "실시간 연동", 10, True).pack(anchor="w", pady=(10, 0))
+        lbl(c, "Claude 에 로그인하면 2분마다 공식 사용률을 받아와, Claude 를 쓰는 만큼 바로 자라요. "
+               "로그인 정보는 Windows 암호화(DPAPI)로 이 PC 에만 저장하고 claude.ai 로만 보내요.",
             8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(2, 0))
         r = tk.Frame(c, bg=C["card"])
         r.pack(fill="x", pady=(6, 0))
+        ttk.Button(r, text="Claude 로그인", style="Accent.TButton", command=self.claude_login).pack(side="left")
+        ttk.Button(r, text="로그아웃", command=self._clear_session_key).pack(side="left", padx=(6, 0))
+        self.l_live = lbl(c, "", 9, wraplength=W(380), justify="left")
+        self.l_live.pack(anchor="w", pady=(4, 0))
+        lbl(c, "로그인 창이 안 되면 (고급): 브라우저 claude.ai → F12 → Application → Cookies → sessionKey 값을 "
+               "아래에 붙여넣기", 8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(8, 0))
+        r = tk.Frame(c, bg=C["card"])
+        r.pack(fill="x", pady=(4, 0))
         self.v_skey = tk.StringVar()
         ttk.Entry(r, textvariable=self.v_skey, show="•", width=28).pack(side="left", fill="x", expand=True)
         ttk.Button(r, text="저장", command=self._save_session_key).pack(side="left", padx=(6, 0))
-        ttk.Button(r, text="삭제", command=self._clear_session_key).pack(side="left", padx=(4, 0))
-        self.l_live = lbl(c, "", 9, wraplength=W(380), justify="left")
-        self.l_live.pack(anchor="w", pady=(4, 0))
         self._update_live_label()
 
         c = card(p)
@@ -1762,17 +1789,51 @@ class App:
     def _update_live_label(self, text: str | None = None, ok: bool | None = None):
         if text is None:
             if not self.comp.s.get("session_key_enc"):
-                text, ok = "연결 안 됨 — 데스크톱 앱 기록(하루 한 번)으로 반영 중", None
+                text, ok = "로그인 안 됨 — 지금은 데스크톱 앱 기록(하루 한 번)으로만 반영돼요", None
             elif getattr(self, "live_err", None):
                 text, ok = f"연결 문제: {self.live_err}", False
             elif self.comp.s.get("live"):
                 lv = self.comp.s["live"]
-                text = (f"연결됨 · {dt.datetime.fromtimestamp(lv['t']):%H:%M} 기준 5시간 {lv['fh']:.0f}% · "
+                text = (f"로그인됨 · {dt.datetime.fromtimestamp(lv['t']):%H:%M} 기준 5시간 {lv['fh']:.0f}% · "
                         f"주간 {lv['sd']:.0f}% · 1% ≈ {fmt_tokens(self.comp.live_k())} 토큰으로 환산")
                 ok = True
             else:
                 text, ok = "저장됨 — 다음 새로고침 때 연결해요", None
         self.l_live.configure(text=text, fg={True: "#2f9e44", False: C["accent"], None: C["sub"]}[ok])
+
+    def claude_login(self):
+        """WebView2 로그인 창(별도 프로세스)을 띄우고, 로그인되면 세션 키를 받아 연결한다."""
+        if getattr(self, "_login_proc", None) and self._login_proc.poll() is None:
+            return  # 이미 열려 있음
+        exe = Path(sys.executable)
+        py = exe.with_name("python.exe") if exe.name.lower() == "pythonw.exe" else exe
+        try:
+            self._login_proc = subprocess.Popen(
+                [str(py), "-m", "poketokenbar.login"], cwd=str(Path(__file__).resolve().parent.parent),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+        except OSError as e:
+            self._update_live_label(f"로그인 창을 열 수 없어요: {e}", False)
+            return
+        self._update_live_label("로그인 창에서 Claude 에 로그인해 주세요…", None)
+        proc = self._login_proc
+
+        def work():
+            key = None
+            for line in proc.stdout:
+                try:
+                    key = json.loads(line).get("sessionKey") or key
+                except ValueError:
+                    pass
+            proc.wait()
+            if not key:
+                self.post(self._update_live_label, "로그인을 마치지 않고 창을 닫았어요", None)
+                return
+            try:
+                live = claude_live.fetch_usage(key)
+                self.post(self._session_key_ok, key, live)
+            except claude_live.LiveError as e:
+                self.post(self._update_live_label, f"로그인은 됐지만 사용량을 못 받았어요: {e}", False)
+        threading.Thread(target=work, daemon=True).start()
 
     def _save_session_key(self):
         key = self.v_skey.get().strip()
@@ -1794,8 +1855,10 @@ class App:
         self.comp.save()
         self.v_skey.set("")
         self.live_err = None
+        self.live_auth_failed = False
         self._update_live_label()
         self.refresh_all()
+        self.tray.notify("Claude 로그인 완료", "이제 Claude 를 쓰는 만큼 포켓몬이 자라요!")
 
     def _clear_session_key(self):
         for k in ("session_key_enc", "live"):
