@@ -375,6 +375,40 @@ class Companion:
         self.s["earned"] += extra_total
         return extra_total, self.feed(extra_total)
 
+    # ---------- Claude 실시간 (claude.ai 세션 키) ----------
+    LIVE_K_DEFAULT = 300_000  # 5시간 사용률 1% ≈ 토큰 (Claude Code 와 같이 쓰면서 자동으로 학습)
+
+    def live_k(self) -> float:
+        r = sorted(self.s.get("live_ratios", []))
+        if len(r) < 3:
+            return float(self.LIVE_K_DEFAULT)
+        return max(50_000.0, min(5_000_000.0, r[int(len(r) * 0.75)]))
+
+    def ingest_live(self, summary, cur: dict) -> tuple[int, list]:
+        """5시간 사용률이 오른 만큼을 토큰으로 환산해, 같은 시간 Claude Code 토큰으로 이미 센 만큼은 빼고 먹인다."""
+        prev = self.s.get("live")
+        self.s["live"] = cur
+        if not prev or prev.get("org") != cur["org"]:
+            return 0, []
+        rolled = (cur.get("fh_reset") and prev.get("fh_reset")
+                  and abs(cur["fh_reset"] - prev["fh_reset"]) > 60 and cur["fh"] < prev["fh"])
+        d = cur["fh"] if rolled else cur["fh"] - prev["fh"]
+        if d <= 0:
+            return 0, []
+        code = summary.claude_tokens_between(prev["t"], cur["t"]) if summary else 0
+        if code > 0 and cur["t"] - prev["t"] < 15 * 60:
+            ratios = self.s.setdefault("live_ratios", [])
+            ratios.append(code / d)
+            del ratios[:-60]
+        extra = int(max(0.0, self.live_k() * d - code))
+        if not extra:
+            return 0, []
+        daily = self.s.setdefault("claude_app_daily", {})
+        day = time.strftime("%Y-%m-%d", time.localtime(cur["t"]))
+        daily[day] = daily.get(day, 0) + extra
+        self.s["earned"] += extra
+        return extra, self.feed(extra)
+
     def claude_app_today(self) -> int:
         return self.s.get("claude_app_daily", {}).get(time.strftime("%Y-%m-%d"), 0)
 

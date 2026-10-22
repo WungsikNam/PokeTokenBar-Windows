@@ -22,6 +22,7 @@ from .companion import (COMMON_GRAD_TOKENS, DEX_MAX, GENERATIONS, ITEM_SPRITES, 
 from .pokedata import PokeData, egg_image, load_frames
 from .usage import UsageScanner, fmt_tokens
 from . import weather as wx
+from . import claude_live
 
 APP_NAME = "PokeTokenBarWin"
 APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
@@ -781,7 +782,14 @@ class App:
         while self.running:
             try:
                 s = self.scanner.scan()
-                self.post(self.on_summary, s)
+                live, live_err = None, None
+                key = self.session_key()
+                if key and self.comp.settings.get("claude_app", True):
+                    try:
+                        live = claude_live.fetch_usage(key, (self.comp.s.get("live") or {}).get("org"))
+                    except claude_live.LiveError as e:
+                        live_err = str(e)
+                self.post(self.on_summary, s, live, live_err)
             except Exception:  # noqa: BLE001
                 log_error(traceback.format_exc())
             self.wake.wait(timeout=max(1, self.comp.settings["refresh_min"]) * 60)
@@ -818,18 +826,29 @@ class App:
         self.wake.set()
 
     # ---------- 데이터 흐름
-    def on_summary(self, s):
+    def session_key(self) -> str | None:
+        enc = self.comp.s.get("session_key_enc")
+        return claude_live.unprotect(enc) if enc else None
+
+    def on_summary(self, s, live=None, live_err=None):
         self.summary = s
+        self.live_err = live_err
         if not self.comp.s.get("calibrated"):
             self.calibrate(silent=True)
         events = self.comp.ingest_total(s.all_time_total)
         if self.comp.settings.get("claude_app", True):
-            _, ev2 = self.comp.ingest_plan_usage(s)
+            if live:
+                _, ev2 = self.comp.ingest_live(s, live)
+            elif not self.session_key():
+                _, ev2 = self.comp.ingest_plan_usage(s)
+            else:
+                ev2 = []  # 키는 있는데 이번 조회만 실패 — 다음 조회에서 증가분이 한꺼번에 반영된다
             events += ev2
         self.comp.save()
         self.handle_events(events)
         self.maybe_hatch()
         self._update_estimate()
+        self._update_live_label()
         self.refresh_all()
 
     def _on_enriched(self, r):
@@ -1275,8 +1294,21 @@ class App:
             lbl(r, ("≈" if m.startswith("Claude 앱") else "") + fmt_tokens(t), 9).pack(side="right")
         self._draw_chart()
         shown = False
-        # Claude 플랜 사용률 (Claude 데스크톱 앱 기록)
-        if s.plan_history:
+        # Claude 플랜 사용률 — 실시간(세션 키) 값 우선, 없으면 데스크톱 앱 기록
+        live = self.comp.s.get("live")
+        if live and self.session_key() and time.time() - live["t"] < 15 * 60:
+            for name, pct, reset in (("Claude 5시간", live["fh"], live.get("fh_reset")),
+                                     ("Claude 주간", live["sd"], live.get("sd_reset"))):
+                shown = True
+                r = tk.Frame(self.h_limits, bg=C["card"])
+                r.pack(fill="x", pady=(6, 0))
+                lbl(r, name, 9).pack(side="left")
+                rs = f" · {dt.datetime.fromtimestamp(reset):%m/%d %H:%M} 리셋" if reset else ""
+                lbl(r, f"{pct:.0f}%{rs}", 9, color=C["sub"]).pack(side="right")
+                cv = tk.Canvas(self.h_limits, width=W(380), height=W(6), highlightthickness=0, bg=C["card"])
+                cv.pack(fill="x", pady=(2, 0))
+                bar(cv, pct / 100, C["accent"] if pct >= 90 else "#fab005" if pct >= 70 else "#40c057")
+        elif s.plan_history:
             t, _, fh, sd = s.plan_history[-1]
             age = time.time() - t
             when = "" if age < 3600 else f" · {dt.datetime.fromtimestamp(t):%m/%d %H:%M} 기준"
@@ -1610,9 +1642,26 @@ class App:
         ttk.Checkbutton(c, text="Claude 앱(채팅·Cowork) 사용분도 포켓몬 성장에 반영",
                         variable=self.v_capp,
                         command=lambda: self._set("claude_app", self.v_capp.get())).pack(anchor="w", pady=(4, 0))
-        lbl(c, "채팅은 토큰 수가 PC에 남지 않아서, Claude 데스크톱 앱이 기록하는 주간 플랜 사용률(%)이 오른 만큼을 "
-               "토큰으로 환산해요. Claude Code로 이미 센 만큼은 빼서 두 번 세지 않아요.",
+        lbl(c, "채팅·데스크톱 앱·Cowork 는 토큰 수가 PC에 남지 않아서, Claude 플랜 사용률(%)이 오른 만큼을 토큰으로 "
+               "환산해요. Claude Code로 이미 센 만큼은 빼서 두 번 세지 않아요.",
             8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(4, 0))
+        lbl(c, "실시간 연동 (claude.ai 세션 키)", 10, True).pack(anchor="w", pady=(10, 0))
+        lbl(c, "세션 키를 넣으면 2분마다 공식 사용률을 받아와, Claude 를 쓰는 만큼 바로 자라요. "
+               "넣지 않으면 데스크톱 앱이 하루 한 번 남기는 기록만 써서 하루 늦게 반영돼요.\n"
+               "받는 법: 브라우저에서 claude.ai 로그인 → F12 → Application(애플리케이션) → Cookies → "
+               "https://claude.ai → sessionKey 값 복사 → 아래에 붙여넣기\n"
+               "세션 키는 계정 접근 권한이 있으니 다른 사람과 공유하지 마세요. 이 앱은 Windows 암호화(DPAPI)로 "
+               "이 PC에만 저장하고 claude.ai 로만 보내요.",
+            8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w", pady=(2, 0))
+        r = tk.Frame(c, bg=C["card"])
+        r.pack(fill="x", pady=(6, 0))
+        self.v_skey = tk.StringVar()
+        ttk.Entry(r, textvariable=self.v_skey, show="•", width=28).pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="저장", command=self._save_session_key).pack(side="left", padx=(6, 0))
+        ttk.Button(r, text="삭제", command=self._clear_session_key).pack(side="left", padx=(4, 0))
+        self.l_live = lbl(c, "", 9, wraplength=W(380), justify="left")
+        self.l_live.pack(anchor="w", pady=(4, 0))
+        self._update_live_label()
 
         c = card(p)
         lbl(c, "날씨", 11, True).pack(anchor="w")
@@ -1709,6 +1758,53 @@ class App:
                "Pokémon © Nintendo / Creatures / GAME FREAK. 비상업 팬 프로젝트입니다.",
             8, color=C["sub"], wraplength=W(380), justify="left").pack(anchor="w")
         self._update_estimate()
+
+    def _update_live_label(self, text: str | None = None, ok: bool | None = None):
+        if text is None:
+            if not self.comp.s.get("session_key_enc"):
+                text, ok = "연결 안 됨 — 데스크톱 앱 기록(하루 한 번)으로 반영 중", None
+            elif getattr(self, "live_err", None):
+                text, ok = f"연결 문제: {self.live_err}", False
+            elif self.comp.s.get("live"):
+                lv = self.comp.s["live"]
+                text = (f"연결됨 · {dt.datetime.fromtimestamp(lv['t']):%H:%M} 기준 5시간 {lv['fh']:.0f}% · "
+                        f"주간 {lv['sd']:.0f}% · 1% ≈ {fmt_tokens(self.comp.live_k())} 토큰으로 환산")
+                ok = True
+            else:
+                text, ok = "저장됨 — 다음 새로고침 때 연결해요", None
+        self.l_live.configure(text=text, fg={True: "#2f9e44", False: C["accent"], None: C["sub"]}[ok])
+
+    def _save_session_key(self):
+        key = self.v_skey.get().strip()
+        if not key:
+            return
+        self._update_live_label("확인하는 중…", None)
+
+        def work():
+            try:
+                live = claude_live.fetch_usage(key)
+                self.post(self._session_key_ok, key, live)
+            except claude_live.LiveError as e:
+                self.post(self._update_live_label, f"저장하지 않았어요: {e}", False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _session_key_ok(self, key, live):
+        self.comp.s["session_key_enc"] = claude_live.protect(key)
+        self.comp.s["live"] = live  # 기준점 — 지금부터 오르는 만큼 반영
+        self.comp.save()
+        self.v_skey.set("")
+        self.live_err = None
+        self._update_live_label()
+        self.refresh_all()
+
+    def _clear_session_key(self):
+        for k in ("session_key_enc", "live"):
+            self.comp.s.pop(k, None)
+        self.comp.save()
+        self.v_skey.set("")
+        self.live_err = None
+        self._update_live_label()
+        self.refresh_all()
 
     def _set_weather(self, on: bool):
         self.comp.settings["weather_boost"] = on
